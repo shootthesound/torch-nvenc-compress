@@ -12,7 +12,7 @@ For multi-GPU on consumer hardware (the 5090 has no NVLink), this approximately 
 
 ## Status: ~75% of the way to the validated NVLink-replacement claim
 
-The full NVLink-replacement claim ("180 GB/s effective cross-GPU bandwidth on the 5090 via NVENC + PCIe") breaks into four building blocks. Three are validated with measurements; the fourth is hardware-blocked.
+The full NVLink-replacement claim ("180 GB/s effective cross-GPU bandwidth on the 5090 via NVENC + PCIe") breaks into four building blocks. Three are validated with measurements; the fourth is queued for the moment a second GPU joins the validation rig.
 
 ![NVLink replacement status](docs/figures/nvlink_status.png)
 
@@ -21,11 +21,11 @@ The full NVLink-replacement claim ("180 GB/s effective cross-GPU bandwidth on th
 | **6× lossless compression on diffusion activations** | ✅ DONE — 6.1× cos 0.991 LOO across 1,735 captures | [`docs/findings.md`](docs/findings.md) |
 | **Codec latency low enough to hide behind PCIe transfer** | ✅ DONE — 0.180 ms/frame encode, 0.262 ms/frame decode (`MultiEngineDirectBackend`, real activations) | [`poc/18`](poc/18_real_activation_bench.py) |
 | **NVENC silicon runs concurrently with SM compute** | ✅ DONE — 67% of theoretical-max parallel-path overlap measured (1.34× over serialized GEMM + encode) | [`poc/17`](poc/17_parallel_path_demo.py) |
-| **Cross-GPU PCIe peer-to-peer integration** | ❌ NOT YET — single-GPU validation rig only; encoder zero-copy + stream binding ready, P2P wiring is the remaining engineering. **Blocked on a second GPU** (4090 laptop incoming). | — |
+| **Cross-GPU PCIe peer-to-peer integration** | ⏳ NEXT — the validation rig is currently a single 5090; encoder-side zero-copy + stream binding are ready and waiting. The cross-GPU peer-to-peer wiring is the next integration milestone, queued for when the **incoming second GPU** (a 4090 laptop) joins the rig. | — |
 
 The codec primitive, the compression ratio, and the architectural parallel-path claim are all measured on a 5090 with real workloads. The remaining 25% is plumbing — no new physics, just integration once the second GPU is in the rig.
 
-### Speed today
+### Codec backend speed (measured)
 
 Real FLUX activations, 668 frames, K=500, QP=18, RTX 5090:
 
@@ -72,7 +72,7 @@ The same 6× compression ratio multiplies the effective bandwidth of every other
 
 This is the load-bearing claim of this project. The diffusion / LLM compression PoCs are the building blocks; the multi-GPU consumer-hardware unlock is the application that matters most.
 
-**Status (as of this commit): ~75% of this claim is validated with measurements.** See the status table at the top of this README and [`docs/parallel_path.md`](docs/parallel_path.md). Three of four building blocks done (compression ratio, fast codec, parallel-path overlap); the fourth (cross-GPU PCIe peer-to-peer wiring) is hardware-blocked on a second GPU joining the rig — no new physics, just integration.
+**Status (as of this commit): ~75% of this claim is validated with measurements.** See the status table at the top of this README and [`docs/parallel_path.md`](docs/parallel_path.md). Three of four building blocks done (compression ratio, fast codec, parallel-path overlap); the fourth (cross-GPU PCIe peer-to-peer wiring) is the next integration step, queued for the second GPU joining the validation rig (incoming) — no new physics, just integration.
 
 **Caveats:** the codec primitive needs to be fast enough (`DirectBackend` ships in this repo and meets the bar — 0.179 ms/frame encode). Requires PCIe peer-to-peer to be working between the two GPUs. Helps when the workload is activation-transfer-bound (which most multi-GPU model parallelism on big LLMs and diffusion models IS), not when it's compute-bound or weight-streaming-bound.
 
@@ -95,9 +95,9 @@ Wall-clock numbers per common scenario, with vs without NVENC compression in the
 
 **All speedup numbers above are 6× for diffusion activations and 3× for LLM KV cache, which match the lossless compression ratios we measured. The math is just `original_bytes / compressed_bytes` once codec time is hidden by pipelining.**
 
-### Measured today (with the slow subprocess pipeline)
+### Measured wall-clock (FFmpeg-subprocess pipeline, before the direct-SDK wrapper)
 
-The table above projects what's possible with a fast codec wrapper. Below are the **actually-measured wall-clock numbers** on a single RTX 5090 with the current FFmpeg-subprocess pipeline. These prove the architectural primitive works *today* for slow-wire scenarios, even before the fast wrapper.
+The table above projects what's possible with a fast codec wrapper. Below are the **actually-measured wall-clock numbers** on a single RTX 5090 with the FFmpeg-subprocess pipeline that this work began with. They establish that the architectural primitive holds for slow-wire scenarios even before any of the fast-wrapper engineering went in — the direct-SDK numbers further up extend the range to the fast wires too.
 
 End-to-end wall-clock to move a 32 MB diffusion-activation tensor from VRAM across various wires (run from `python poc/08_wire_simulation.py`; codec time is real, wire time is `sleep(bytes/bandwidth)`):
 
@@ -120,9 +120,9 @@ End-to-end wall-clock for moving 8 tensors via three offload strategies (run fro
 
 The take-aways:
 
-- **For slow consumer wires (1 Gbit ethernet and below)**, the codec path beats direct transmission TODAY, with no fast wrapper required. Hybrid local + cloud inference over residential broadband is already a 3-5× wall-clock win.
-- **For fast wires (PCIe, 10 Gbit)**, the FFmpeg subprocess overhead currently bottlenecks the codec lane. The fast wrapper (PyAV / Video Codec SDK) is needed to realise the projected speedups above.
-- **Dual-lane offload** (some tensors via direct, some via codec) wins ~1.7× on gigabit and ~2× on residential broadband even today — the codec lane operates concurrently on its own hardware (NVENC silicon) and consumes only the small compressed bytes on the shared wire.
+- **For slow consumer wires (1 Gbit ethernet and below)**, the codec path beats direct transmission with no fast wrapper required — the FFmpeg-subprocess overhead is a constant that's small relative to multi-second wire transfer time. Hybrid local + cloud inference over residential broadband is a 3–5× wall-clock win at this stage already.
+- **For fast wires (PCIe, 10 Gbit)**, the FFmpeg-subprocess overhead bottlenecks the codec lane. The direct Video Codec SDK wrapper (`DirectBackend` further up the README) is what extends the wins to these wires.
+- **Dual-lane offload** (some tensors via direct, some via codec) wins ~1.7× on gigabit and ~2× on residential broadband even with the subprocess pipeline — the codec lane operates concurrently on its own hardware (NVENC silicon) and consumes only the small compressed bytes on the shared wire.
 
 ### Bonus: even WITHOUT compression, the dual-lane argument
 
@@ -155,11 +155,11 @@ The full reframe in [`docs/parallel_path.md`](docs/parallel_path.md).
 
 ## Possible applications
 
-The compression primitive + parallel-path reframe + the `DirectBackend` codec all compose into the same set of usable wins. Here's where this lands in real workflows, with status markers (✅ measured / ⚠️ codec primitive ready, integration is the remaining work / ❌ blocked on hardware).
+The compression primitive + parallel-path reframe + the `DirectBackend` codec all compose into the same set of usable wins. Here's where this lands in real workflows, with status markers (✅ measured / ⚠️ codec primitive ready, integration is the remaining work / ⏳ queued for the next piece of validation hardware).
 
 ### 1. Consumer multi-GPU inference (the "NVLink replacement")
 
-- **Splitting massive LLMs (70B+) across 4090s/5090s** — NVIDIA stripped NVLink from the consumer cards, so cross-GPU activation transfer drops to ~30 GB/s over PCIe peer-to-peer. Compressed activations through the same lane multiply effective bandwidth to ~180 GB/s, putting consumer multi-GPU inference in the same band as A6000 / H100 setups for the activation-transfer part of the workload. ⚠️ codec primitive ready (`MultiEngineDirectBackend` at 0.180 ms/frame encode); cross-GPU peer-to-peer integration is the remaining 25%, blocked on a second GPU joining the validation rig.
+- **Splitting massive LLMs (70B+) across 4090s/5090s** — NVIDIA stripped NVLink from the consumer cards, so cross-GPU activation transfer drops to ~30 GB/s over PCIe peer-to-peer. Compressed activations through the same lane multiply effective bandwidth to ~180 GB/s, putting consumer multi-GPU inference in the same band as A6000 / H100 setups for the activation-transfer part of the workload. ⏳ codec primitive ready (`MultiEngineDirectBackend` at 0.180 ms/frame encode); cross-GPU peer-to-peer integration is the remaining 25%, queued for the second GPU joining the validation rig.
 - **Multi-GPU diffusion (FLUX.1 / FLUX.2)** — same primitive, same gain. Two GPUs in one workstation can split a 12B image model without PCIe choking generation. The 6× lossless compression ratio measured on diffusion mid-block activations directly translates to 6× higher effective cross-GPU bandwidth.
 
 ### 2. Solving the "low VRAM" LLM crisis
@@ -169,7 +169,7 @@ The compression primitive + parallel-path reframe + the `DirectBackend` codec al
 
 ### 3. Hobbyist + gigabit GPU clusters
 
-- **"Poor man's datacenter" (1 Gbit / 10 Gbit ethernet)** — Two desktop machines (e.g. a 5090 + a 4090) wired together with standard home networking to run a split model. Diffusion activation transfer at 6× compression gives a ~6× speedup on the network leg, shifting the bottleneck back to the GPUs where it belongs. ✅ codec already wins on consumer wires today (1.69× dual-lane on 1 Gbit measured in [`poc/09`](poc/09_dual_lane.py)) and the new `DirectBackend` makes the per-frame codec time small enough to hide entirely behind gigabit transfer.
+- **"Poor man's datacenter" (1 Gbit / 10 Gbit ethernet)** — Two desktop machines (e.g. a 5090 + a 4090) wired together with standard home networking to run a split model. Diffusion activation transfer at 6× compression gives a ~6× speedup on the network leg, shifting the bottleneck back to the GPUs where it belongs. ✅ codec wins on consumer wires are validated (1.69× dual-lane on 1 Gbit measured in [`poc/09`](poc/09_dual_lane.py)) and `DirectBackend` makes the per-frame codec time small enough to hide entirely behind gigabit transfer.
 - **Distributed training gradient sync** — Cross-machine training over consumer networks is normally killed by gradient bandwidth. Shipping compressed gradients makes hobbyist distributed training viable.
 
 ### 4. Cloud-hybrid edge computing
@@ -204,12 +204,12 @@ Full Pareto tables and methodology in [`docs/findings.md`](docs/findings.md).
 
 ## What's measured vs what's projected (read this before you cite the speedups)
 
-**Measured today** (real, reproducible numbers):
+**Measured** (real, reproducible numbers):
 
 - ✅ **Compression ratios** — LOO-validated. 6× lossless on diffusion activations, 2.7× lossless on KV cache. See [`docs/findings.md`](docs/findings.md).
 - ✅ **Codec round-trip latency** — ~577 ms (subprocess) / ~466 ms (PyAV per-call, 1.24×) / ~180 ms per tensor with **CodecSession** (persistent NVENC context, 1.77×) / **~108 ms per tensor with `MultiEngineCodecSession`** (parallel across the GPU's 3 NVENC engines on a 5090, **2.81× faster than subprocess** on batch workloads) / **DirectBackend** (pure ctypes against driver DLLs, zero-copy CUDA + 8-deep output pool — **0.237 ms/frame encode, 0.499 ms/frame decode**, 2.07× / 1.84× over PyAV CodecSession on real FLUX activations) / **MultiEngineDirectBackend** (DirectBackend × 3 NVENC engines on the 5090, with per-engine pool — **0.179 ms/frame encode, 0.301 ms/frame decode**, **2.83× end-to-end over PyAV CodecSession** at equal-or-better reconstruction quality). See [`poc/06_pcie_microbench.py`](poc/06_pcie_microbench.py), [`poc/11_codec_session_bench.py`](poc/11_codec_session_bench.py), [`poc/12_multi_engine_bench.py`](poc/12_multi_engine_bench.py), [`poc/16_direct_backend_bench.py`](poc/16_direct_backend_bench.py), and [`poc/18_real_activation_bench.py`](poc/18_real_activation_bench.py).
 - ✅ **Subprocess overhead breakdown** — ~171 ms of every subprocess call is pure FFmpeg startup (66%); PyAV eliminates ~112 ms of that. See [`poc/10_codec_overhead_breakdown.py`](poc/10_codec_overhead_breakdown.py).
-- ✅ **Slow-wire wins** — codec already beats direct transmission on residential broadband (3.13× at 100 Mbps, 5.29× at 50 Mbps) and dual-lane wins on gigabit (1.69×) — TODAY, with the slow pipeline. See [`poc/08`](poc/08_wire_simulation.py) and [`poc/09`](poc/09_dual_lane.py).
+- ✅ **Slow-wire wins** — codec beats direct transmission on residential broadband (3.13× at 100 Mbps, 5.29× at 50 Mbps) and dual-lane wins on gigabit (1.69×). Validated even with the original FFmpeg-subprocess pipeline; the direct-SDK wrapper extends these to fast wires. See [`poc/08`](poc/08_wire_simulation.py) and [`poc/09`](poc/09_dual_lane.py).
 
 **Projected** (math from the measurements above):
 
@@ -219,13 +219,13 @@ Full Pareto tables and methodology in [`docs/findings.md`](docs/findings.md).
 
 What this means for you, depending on your use case:
 
-| Use case | Works TODAY? |
+| Use case | Status |
 |---|---|
-| Residential broadband cloud-hybrid inference | ✅ yes (3-5× wins measured even with subprocess; even faster with `DirectBackend`) |
-| Gigabit cluster split-model inference | ✅ yes with `DirectBackend` (0.237 ms/frame encode hides comfortably behind gigabit transfer time) |
-| 10 Gbit ethernet / NVMe | ✅ yes with `DirectBackend` (codec time is now <1 ms/frame, well under 10G transfer of 32 MB activation) |
+| Residential broadband cloud-hybrid inference | ✅ validated (3–5× wins measured even with the subprocess pipeline; faster again with `DirectBackend`) |
+| Gigabit cluster split-model inference | ✅ ready with `DirectBackend` (0.237 ms/frame encode hides comfortably behind gigabit transfer time) |
+| 10 Gbit ethernet / NVMe | ✅ ready with `DirectBackend` (codec time is sub-millisecond per frame, well under 10G transfer of a 32 MB activation) |
 | PCIe peer-to-peer (multi-GPU NVLink replacement) | ⚠️ encoder side ready (`DirectBackend` zero-copy + stream binding); cross-GPU peer-to-peer integration is the remaining work |
-| Single-GPU activation cache compression | ✅ yes (storage + load savings real today) |
+| Single-GPU activation cache compression | ✅ ready (storage + load savings validated) |
 
 The compression is real and validated. The fast codec wrapper now exists. Multi-GPU peer-to-peer integration is the last piece. PRs welcome.
 
@@ -235,7 +235,7 @@ The compression is real and validated. The fast codec wrapper now exists. Multi-
 
 The "video codecs as tensor codecs" insight is **not new**. It hit the academic mainstream in late 2025 and early 2026 from at least three different research groups:
 
-- **[LLM.265](https://arxiv.org/) — "Video Codecs are Secretly Tensor Codecs"** (late 2025). Same core insight, applied to LLM weights, activations, and KV cache. Demonstrates that idle on-chip video encoders can compress model state at no additional cost.
+- **LLM.265 — "Video Codecs are Secretly Tensor Codecs"** (late 2025). Same core insight, applied to LLM weights, activations, and KV cache. Demonstrates that idle on-chip video encoders can compress model state at no additional cost. (Search arXiv for the title to find the latest version.)
 - **KVFetcher** (April 2026). Specifically uses GPU-native video codecs to compress KV cache into a compact video format for transmission over bandwidth-limited networks during remote prefix fetching.
 - **CodecFlow** (April 2026). A different angle: exploits codec metadata (motion vectors) extracted during video decoding to selectively guide KV cache refresh during LLM prefilling.
 
@@ -251,7 +251,7 @@ The shape of the idea is established and being actively published. **What this r
 
 5. **Honest negative results.** Three runnable PoCs in [`poc/null_findings/`](poc/null_findings/) document things that did NOT crack the Pareto open: sparse residual (uniform error, not concentrated), AV1 NVENC (Blackwell only does 4:2:0; 1ch-per-Y-plane workaround loses to HEVC), channel reordering (PCA already removes correlations). Saves anyone else from re-running the same dead-ends.
 
-6. **End-to-end wall-clock numbers measured TODAY.** With the slow subprocess pipeline, codec already wins on consumer wires: 3.13× on 100 Mbps residential, 1.69× dual-lane on 1 Gbit ethernet. Not projections — measurements ([`poc/08`](poc/08_wire_simulation.py), [`poc/09`](poc/09_dual_lane.py)).
+6. **End-to-end wall-clock measurements at multiple wrapper tiers.** The original FFmpeg-subprocess pipeline already wins on consumer wires (3.13× on 100 Mbps residential, 1.69× dual-lane on 1 Gbit ethernet); the direct Video Codec SDK wrapper extends those wins to fast wires (PCIe / 10 Gbit / NVMe). Not projections — measurements ([`poc/08`](poc/08_wire_simulation.py), [`poc/09`](poc/09_dual_lane.py), [`poc/16`](poc/16_direct_backend_bench.py), [`poc/18`](poc/18_real_activation_bench.py)).
 
 If you're doing academic work on this primitive, **please cite the prior art above** — those papers established the core insight. The specific contributions of this repo are independent and worth citing where load-bearing for your work: the heavy-tailed channel-covariance spectrum that makes PCA + truncation the right preprocessing (point 2 above), the parallel-path / dual-lane architectural reframe (point 3), the NVLink-replacement framing for consumer multi-GPU (point 4), and the documented negative results (point 5).
 
@@ -377,11 +377,25 @@ Apache 2.0. See [LICENSE](LICENSE).
 
 ## Acknowledgements
 
+### Prior art this work builds on
+
+The core "video codecs as tensor codecs" insight was already established in academic publications before this repo existed. Listed here both as an honest credit and so anyone citing this work also cites the upstream sources.
+
+- **LLM.265 — "Video Codecs are Secretly Tensor Codecs"** (late 2025). The closest direct analogue: same insight, applied to LLM weights, activations, and KV cache. See arXiv (search the title for the latest version).
+- **KVFetcher** (April 2026). Uses GPU-native video codecs to compress KV cache for remote prefix fetching across bandwidth-limited networks.
+- **CodecFlow** (April 2026). Uses codec-internal motion-vector metadata to guide KV cache refresh during LLM prefill — a different angle on the same hardware.
+
+This repo's added contributions over those (PCA + rank-truncation as the load-bearing preprocessing step, the parallel-path / dual-lane architectural reframe, the multi-GPU NVLink-replacement framing, the `DirectBackend` pure-ctypes Video Codec SDK wrapper, and the documented null findings) are detailed in the "Prior art and what's new" section above.
+
+### Models, libraries, communities
+
 - Black Forest Labs for FLUX.1-schnell and FLUX.2 Klein
 - Mistral AI for Mistral 7B v0.3
 - Alibaba / Qwen team for Qwen 2.5
-- The Hugging Face team for `diffusers` and `transformers`
-- The codec community for ~30 years of progress in video compression that we're piggy-backing on
+- The [Hugging Face](https://huggingface.co/) team for `diffusers` and `transformers`
+- The [PyAV](https://pyav.org/) maintainers for the in-process FFmpeg bindings the early codec wrapper depends on
+- [FFmpeg](https://ffmpeg.org/) and [nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers) — the latter was the source-of-truth header reference used to verify every NVENC struct layout in `src/nvenc_compress/direct/`
+- The codec community for ~30 years of progress in video compression this work piggy-backs on
 
 ## Support this work
 

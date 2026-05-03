@@ -164,21 +164,21 @@ def fig_nvlink_status():
         "Compression ratio\n(6× lossless on diffusion)",
         "Codec latency\n(0.180 ms/f encode)",
         "Parallel-path overlap\n(67% measured)",
-        "Cross-GPU PCIe P2P\n(blocked on 2nd GPU)",
+        "Cross-GPU PCIe P2P\n(awaiting 2nd GPU)",
     ]
     pct = [100, 100, 100, 0]
     colors = [COLORS["nvlink-3090"], COLORS["nvlink-3090"],
-              COLORS["nvlink-3090"], "#e9b3b3"]
+              COLORS["nvlink-3090"], "#f4d8a3"]
 
     fig, ax = plt.subplots(figsize=(9, 4), dpi=140)
     bars = ax.barh(blocks, pct, color=colors, edgecolor="black", linewidth=0.5)
-    for b, p, label in zip(bars, pct, ["DONE", "DONE", "DONE", "BLOCKED"]):
+    for b, p, label in zip(bars, pct, ["DONE", "DONE", "DONE", "QUEUED"]):
         ax.text(min(p + 2, 102), b.get_y() + b.get_height()/2,
                 f"{p}%  {label}", va="center", fontsize=10, fontweight="bold")
     ax.set_xlim(0, 110)
     ax.set_xlabel("validation % per building block")
     ax.set_title("NVLink-replacement claim status — ~75% validated\n"
-                 "(three of four building blocks fully measured; the fourth is hardware-blocked)")
+                 "(three of four building blocks fully measured; the fourth is queued for the incoming second GPU)")
     ax.invert_yaxis()
     ax.grid(axis="x", linestyle=":", alpha=0.4)
     ax.spines["top"].set_visible(False)

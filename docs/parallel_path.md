@@ -88,14 +88,14 @@ The same multiplier applies to every other wire on the system — the codec hard
 
 ![NVLink replacement claim status](figures/nvlink_status.png)
 
-The claim breaks into four building blocks. Three are done; the fourth is hardware-blocked.
+The claim breaks into four building blocks. Three are done; the fourth is queued for the second GPU joining the validation rig.
 
 | Building block | Status | Evidence |
 |---|---|---|
 | **Compression ratio ≥ 6× lossless on diffusion activations** | ✅ DONE | LOO-validated 6.1× at QP=10 / cos 0.991 across 1,735 captures from FLUX.2 Klein 9B mid-block. See [`findings.md`](findings.md). |
 | **Codec latency low enough to hide behind PCIe transfer** | ✅ DONE | `DirectBackend` (multi-engine) measures **0.179 ms/frame encode + 0.301 ms/frame decode** on real activations. PCIe transfer of an uncompressed 32 MB activation is ~1 ms, of the compressed bytes is ~0.17 ms — codec time hides comfortably. See [`poc/16`](../poc/16_direct_backend_bench.py) and [`poc/18`](../poc/18_real_activation_bench.py). |
 | **NVENC silicon runs concurrently with SM compute** | ✅ DONE | `nvEncSetIOCudaStreams` + parallel-path demo measures **67% of theoretical-max overlap** on a 30×4096² fp16 GEMM + 64-frame encode (1.34× speedup over serialized). The architectural claim is validated; remaining gap is per-frame Python ctypes overhead. See [`poc/17`](../poc/17_parallel_path_demo.py). |
-| **Cross-GPU PCIe peer-to-peer transfer integrated end-to-end** | ❌ NOT YET | Single-GPU validation rig only. The encoder zero-copy + stream binding are ready; the cross-GPU wiring (peer-to-peer enable, IOMMU, real activation transfer) is the remaining engineering work. **Blocked on a second GPU joining the rig** (4090 laptop incoming per project log). |
+| **Cross-GPU PCIe peer-to-peer transfer integrated end-to-end** | ⏳ NEXT | Single-GPU validation rig at present. The encoder zero-copy + stream binding are ready and waiting; the cross-GPU wiring (peer-to-peer enable, IOMMU, real activation transfer) is the next integration milestone, queued for the **incoming second GPU** (a 4090 laptop, per project log). |
 
 So we're at **~75% of the validated NVLink-replacement claim** — three of the four building blocks fully measured, the fourth ready to integrate when the hardware lands. No new physics is required for the remaining 25%; it's wiring.
 
@@ -185,7 +185,7 @@ vs the original FFmpeg subprocess baseline:
 - Wire DirectBackend's encode output → peer GPU memory → other DirectBackend's decode in a single round-trip
 - End-to-end measured wall-clock benchmark on a real multi-GPU model split
 
-This is the remaining ~25% of the killer claim; blocked on a second GPU joining the validation rig (currently single 5090; a 4090 laptop is incoming per the project log). No new physics — just integration engineering.
+This is the remaining ~25% of the killer claim, queued for the second GPU joining the validation rig (currently a single 5090; a 4090 laptop is incoming per the project log). No new physics — just integration engineering.
 
 #### Option A3: MultiEngineCodecSession (parallel across NVENC engines, **shipped in this repo**)
 
