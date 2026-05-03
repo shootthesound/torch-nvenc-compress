@@ -352,3 +352,15 @@ Apache 2.0. See [LICENSE](LICENSE).
 - Alibaba / Qwen team for Qwen 2.5
 - The Hugging Face team for `diffusers` and `transformers`
 - The codec community for ~30 years of progress in video compression that we're piggy-backing on
+
+## Support this work
+
+This project has been months of independent research and engineering — designing the PCA + codec pipeline, validating it across 1,735 FLUX captures, writing the direct Video Codec SDK bindings from scratch (~800 lines of ctypes structs verified field-by-field against `nvEncodeAPI.h`), tracking down every silent struct-layout bug to make the speedup numbers above real, and writing it all up so others can reproduce it.
+
+I'm a work-from-home dad, and the time for this happens around caring for two children with additional needs. If any of this work is useful to you and you'd like to help make more of it possible, a coffee genuinely helps — there's no expectation, just gratitude for whatever lands.
+
+<p align="left">
+  <a href="https://buymeacoffee.com/lorasandlenses">
+    <img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy me a coffee" />
+  </a>
+</p>
