@@ -153,6 +153,36 @@ The full reframe in [`docs/parallel_path.md`](docs/parallel_path.md).
 
 ---
 
+## Possible applications
+
+The compression primitive + parallel-path reframe + the `DirectBackend` codec all compose into the same set of usable wins. Here's where this lands in real workflows, with status markers (✅ measured / ⚠️ codec primitive ready, integration is the remaining work / ❌ blocked on hardware).
+
+### 1. Consumer multi-GPU inference (the "NVLink replacement")
+
+- **Splitting massive LLMs (70B+) across 4090s/5090s** — NVIDIA stripped NVLink from the consumer cards, so cross-GPU activation transfer drops to ~30 GB/s over PCIe peer-to-peer. Compressed activations through the same lane multiply effective bandwidth to ~180 GB/s, putting consumer multi-GPU inference in the same band as A6000 / H100 setups for the activation-transfer part of the workload. ⚠️ codec primitive ready (`MultiEngineDirectBackend` at 0.180 ms/frame encode); cross-GPU peer-to-peer integration is the remaining 25%, blocked on a second GPU joining the validation rig.
+- **Multi-GPU diffusion (FLUX.1 / FLUX.2)** — same primitive, same gain. Two GPUs in one workstation can split a 12B image model without PCIe choking generation. The 6× lossless compression ratio measured on diffusion mid-block activations directly translates to 6× higher effective cross-GPU bandwidth.
+
+### 2. Solving the "low VRAM" LLM crisis
+
+- **Long-context KV-spill** — At 64K / 128K context, KV cache exceeds VRAM and spills to system RAM; pulling it back across PCIe per token drops decode to ~3 tok/s on a 32B model. Compressing KV at ~3× lossless gives a direct ~3× boost on the bandwidth-bound side, taking the same workload to ~9 tok/s. ⚠️ compression ratio measured (2.7× lossless on Mistral 7B / 1024-channel KV — see [`docs/findings.md`](docs/findings.md)); end-to-end tok/s benchmark on a real LLM decode loop is the next integration step.
+- **Supercharged NVMe offload** — KV (or weight) cache parked on a Gen4 NVMe runs at ~7 GB/s sustained; with 6× compression in the read/write path that's ~42 GB/s effective bandwidth into VRAM. Disk-backed inference becomes meaningfully usable.
+
+### 3. Hobbyist + gigabit GPU clusters
+
+- **"Poor man's datacenter" (1 Gbit / 10 Gbit ethernet)** — Two desktop machines (e.g. a 5090 + a 4090) wired together with standard home networking to run a split model. Diffusion activation transfer at 6× compression gives a ~6× speedup on the network leg, shifting the bottleneck back to the GPUs where it belongs. ✅ codec already wins on consumer wires today (1.69× dual-lane on 1 Gbit measured in [`poc/09`](poc/09_dual_lane.py)) and the new `DirectBackend` makes the per-frame codec time small enough to hide entirely behind gigabit transfer.
+- **Distributed training gradient sync** — Cross-machine training over consumer networks is normally killed by gradient bandwidth. Shipping compressed gradients makes hobbyist distributed training viable.
+
+### 4. Cloud-hybrid edge computing
+
+- **Local + cloud split inference** — Front half of a heavy model on a laptop, back half on a rented H100. The intermediate activation ride over residential broadband used to be the killer. ✅ measured **3.13× speedup on 100 Mbps residential, 5.29× on 50 Mbps** ([`poc/08`](poc/08_wire_simulation.py)) — even with the original FFmpeg-subprocess pipeline; with `DirectBackend` the codec time is now firmly under the wire time.
+- **Remote KV cache fetching** — Pre-computed prompt KV ships from a central inference server down to edge devices over the open internet. Same compression ratios, same wire-time win.
+
+### 5. Gaming + game-dev tools (the dual-lane boost)
+
+- **Concurrent ML and texture streaming** — A modern game (or DCC tool) running an ML model alongside a heavy 3D pipeline competes for PCIe bandwidth. Routing the ML activation traffic through NVENC silicon — which doesn't touch the SM cluster *or* the PCIe data path — leaves the main lanes free for textures. ✅ measured **~2× aggregate throughput** for heterogeneous traffic in [`poc/09`](poc/09_dual_lane.py). The dual-lane argument holds even when compression is poor or absent: the second lane is a *new* hardware data path, not just a smaller payload.
+
+---
+
 ## What we actually measured (the compression Pareto)
 
 Headline numbers are LOO-validated (leave-one-out across N captures, the honest generalisation test):
