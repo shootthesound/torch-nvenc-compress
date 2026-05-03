@@ -44,7 +44,12 @@ from .structs import (
     map_input_resource, unmap_input_resource,
     set_io_cuda_streams,
     NV_ENC_BUFFER_FORMAT_YUV444,
+    # Lower-level struct types + version constants for the pre-bound fast path
+    NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER,
+    NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_BITSTREAM_VER,
+    NV_ENC_MAP_INPUT_RESOURCE, NV_ENC_MAP_INPUT_RESOURCE_VER,
 )
+from .api import NVENCSTATUS
 from .decoder import (
     CUVIDPARSERPARAMS, CUVIDSOURCEDATAPACKET, CUVIDPROCPARAMS,
     CUVIDDECODECREATEINFO,
@@ -156,6 +161,41 @@ class DirectBackend:
         self._cuda_buf_size = 0
         self._registered_res_pool: list = []      # K registered_resource handles
 
+        # ---- Pre-bound ctypes function wrappers + reusable structs --------
+        # Wrapping table.nvEncXxx with CFUNCTYPE allocates ~hundreds of bytes
+        # and runs ctypes meta-machinery; doing it per call costs a meaningful
+        # fraction of per-frame latency. Bind once here, reuse forever.
+        from ctypes import CFUNCTYPE, POINTER, c_void_p
+        self._fn_map = CFUNCTYPE(NVENCSTATUS, c_void_p, POINTER(NV_ENC_MAP_INPUT_RESOURCE))(
+            self._table.nvEncMapInputResource
+        )
+        self._fn_unmap = CFUNCTYPE(NVENCSTATUS, c_void_p, c_void_p)(
+            self._table.nvEncUnmapInputResource
+        )
+        self._fn_encode = CFUNCTYPE(NVENCSTATUS, c_void_p, POINTER(NV_ENC_PIC_PARAMS))(
+            self._table.nvEncEncodePicture
+        )
+        self._fn_lock = CFUNCTYPE(NVENCSTATUS, c_void_p, POINTER(NV_ENC_LOCK_BITSTREAM))(
+            self._table.nvEncLockBitstream
+        )
+        self._fn_unlock = CFUNCTYPE(NVENCSTATUS, c_void_p, c_void_p)(
+            self._table.nvEncUnlockBitstream
+        )
+        # Persistent NV_ENC_PIC_PARAMS — most fields are the same every call.
+        # Only inputBuffer / outputBitstream / encodePicFlags change per frame.
+        self._pic = NV_ENC_PIC_PARAMS()
+        self._pic.version = NV_ENC_PIC_PARAMS_VER
+        self._pic.inputWidth = width
+        self._pic.inputHeight = height
+        self._pic.inputPitch = width
+        self._pic.bufferFmt = NV_ENC_BUFFER_FORMAT_YUV444
+        self._pic.pictureStruct = 1  # NV_ENC_PIC_STRUCT_FRAME
+        # Persistent lock-bitstream struct.
+        self._lock = NV_ENC_LOCK_BITSTREAM()
+        self._lock.version = NV_ENC_LOCK_BITSTREAM_VER
+        # Per-slot map-input-resource structs (filled lazily after registration).
+        self._map_structs: list[NV_ENC_MAP_INPUT_RESOURCE] = []
+
     # ---- encode side ------------------------------------------------------
 
     def encode_frames(self, frames: np.ndarray) -> list[bytes]:
@@ -213,13 +253,20 @@ class DirectBackend:
                 raise RuntimeError(f"cuMemAlloc({size}) failed: {err}")
             buf = int(dptr)
             self._cuda_bufs.append(buf)
-            self._registered_res_pool.append(register_cuda_resource(
+            rr = register_cuda_resource(
                 self._table, self._encoder,
                 cuda_ptr=buf,
                 width=self.width, height=self.height,
                 pitch=self.width,
                 buffer_format=NV_ENC_BUFFER_FORMAT_YUV444,
-            ))
+            )
+            self._registered_res_pool.append(rr)
+            # Pre-fill the per-slot map struct (registeredResource is the only
+            # field that needs to be set; mappedResource is filled by the call).
+            mp = NV_ENC_MAP_INPUT_RESOURCE()
+            mp.version = NV_ENC_MAP_INPUT_RESOURCE_VER
+            mp.registeredResource = rr.value if hasattr(rr, "value") else rr
+            self._map_structs.append(mp)
 
     def encode_tensor_frames(self, tensor: torch.Tensor) -> list[bytes]:
         """Encode N frames from a CUDA torch tensor — no host-side copy.
@@ -255,72 +302,95 @@ class DirectBackend:
         per_frame_bytes = self._cuda_buf_size
         K = self._output_pool_size
 
-        # Per-frame state we need to remember across the ring window:
-        #   in_flight[ring_slot] = (mapped_resource, frame_index_for_ordering)
-        in_flight: list[Optional[tuple]] = [None] * K
-        # Output packets indexed by frame number — encoder may emit them
-        # in different order than we issue (esp. with B-frames), but we
-        # disabled B-frames so order is preserved. Use a list anyway for
-        # safety.
+        # Bind everything we need into local names — local lookups are
+        # ~5x faster than attribute lookups in CPython's hot loop.
+        encoder = self._encoder
+        cuda_bufs = self._cuda_bufs
+        out_pool = self._out_pool
+        map_structs = self._map_structs
+        pic = self._pic
+        lock_struct = self._lock
+        fn_map = self._fn_map
+        fn_unmap = self._fn_unmap
+        fn_encode = self._fn_encode
+        fn_lock = self._fn_lock
+        fn_unlock = self._fn_unlock
+        stream = self._user_stream
+        cuMemcpyDtoDAsync = cuda.cuMemcpyDtoDAsync
+        cuMemcpyDtoD = cuda.cuMemcpyDtoD
+        from ctypes import byref, string_at, c_void_p
+        flags_idr = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS
+
+        # in_flight[slot] = frame_index, or -1 if empty
+        in_flight = [-1] * K
         out: list[Optional[bytes]] = [None] * N
 
         def drain_slot(slot: int) -> None:
-            """Lock+read the bitstream buffer at ring[slot], record its
-            packet, and unmap the input it was using."""
-            entry = in_flight[slot]
-            if entry is None:
+            frame_idx = in_flight[slot]
+            if frame_idx < 0:
                 return
-            mapped, frame_idx = entry
-            pkt = lock_and_read_bitstream(self._table, self._encoder,
-                                            self._out_pool[slot])
-            out[frame_idx] = pkt
-            unmap_input_resource(self._table, self._encoder, mapped)
-            in_flight[slot] = None
+            buf = out_pool[slot]
+            lock_struct.outputBitstream = buf
+            s = fn_lock(encoder, byref(lock_struct))
+            if s != 0:
+                raise RuntimeError(f"nvEncLockBitstream failed: status={s}")
+            out[frame_idx] = string_at(lock_struct.bitstreamBufferPtr,
+                                        lock_struct.bitstreamSizeInBytes)
+            s = fn_unlock(encoder, buf)
+            if s != 0:
+                raise RuntimeError(f"nvEncUnlockBitstream failed: status={s}")
+            # Unmap the input that was used for this slot
+            mp = map_structs[slot]
+            s = fn_unmap(encoder, mp.mappedResource)
+            if s != 0:
+                raise RuntimeError(f"nvEncUnmapInputResource failed: status={s}")
+            mp.mappedResource = None
+            in_flight[slot] = -1
 
         for i in range(N):
             slot = i % K
 
-            # If this slot still holds an in-flight frame, drain it before
-            # we overwrite — this is the only blocking sync point.
-            if in_flight[slot] is not None:
+            # If this slot still holds an in-flight frame, drain it before reuse
+            if in_flight[slot] >= 0:
                 drain_slot(slot)
 
-            # GPU-side copy from tensor[i] into THIS slot's registered
-            # staging buffer. Slots have independent buffers so frames in
-            # other slots are not corrupted while their encodes are in flight.
+            # GPU-side copy from tensor[i] into THIS slot's registered staging buffer
             src_ptr = int(tensor[i].data_ptr())
-            slot_dst = self._cuda_bufs[slot]
-            if self._user_stream is not None:
-                err = cuda.cuMemcpyDtoDAsync(slot_dst, src_ptr,
-                                              per_frame_bytes, self._user_stream)
+            slot_dst = cuda_bufs[slot]
+            if stream is not None:
+                err = cuMemcpyDtoDAsync(slot_dst, src_ptr, per_frame_bytes, stream)
             else:
-                err = cuda.cuMemcpyDtoD(slot_dst, src_ptr, per_frame_bytes)
+                err = cuMemcpyDtoD(slot_dst, src_ptr, per_frame_bytes)
             err_int = int(err[0]) if isinstance(err, tuple) else int(err)
             if err_int != 0:
                 raise RuntimeError(f"cuMemcpy(D2D) failed: {err_int}")
 
-            mapped = map_input_resource(self._table, self._encoder,
-                                          self._registered_res_pool[slot])
-            flags = (NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) if i == 0 else 0
-            s = encode_picture(self._table, self._encoder, mapped,
-                                self._out_pool[slot], self.width, self.height,
-                                pic_flags=flags,
-                                buffer_format=NV_ENC_BUFFER_FORMAT_YUV444)
-            if s != 0 and s != 14:
-                # Best-effort cleanup of the unmapped input
-                unmap_input_resource(self._table, self._encoder, mapped)
-                raise RuntimeError(f"encode_picture status={s}")
-            if s == 0:
-                in_flight[slot] = (mapped, i)
-            else:
-                # NEED_MORE_INPUT — encoder is buffering. Unmap input now;
-                # later encodes will produce the deferred output. Since we
-                # disabled B-frames this shouldn't happen but guard anyway.
-                unmap_input_resource(self._table, self._encoder, mapped)
+            # Map input resource for this slot (re-uses the per-slot struct)
+            mp = map_structs[slot]
+            s = fn_map(encoder, byref(mp))
+            if s != 0:
+                raise RuntimeError(f"nvEncMapInputResource failed: status={s}")
 
-        # Drain any remaining in-flight frames.
+            # Update only the changing fields of the persistent pic struct
+            pic.inputBuffer = mp.mappedResource
+            pic.outputBitstream = out_pool[slot]
+            pic.encodePicFlags = flags_idr if i == 0 else 0
+
+            s = fn_encode(encoder, byref(pic))
+            if s != 0 and s != 14:
+                fn_unmap(encoder, mp.mappedResource)
+                mp.mappedResource = None
+                raise RuntimeError(f"nvEncEncodePicture failed: status={s}")
+            if s == 0:
+                in_flight[slot] = i
+            else:
+                # NEED_MORE_INPUT — shouldn't happen with bf=0 but unmap to be safe
+                fn_unmap(encoder, mp.mappedResource)
+                mp.mappedResource = None
+
+        # Drain any remaining in-flight frames
         for slot in range(K):
-            if in_flight[slot] is not None:
+            if in_flight[slot] >= 0:
                 drain_slot(slot)
 
         return [p for p in out if p is not None]
