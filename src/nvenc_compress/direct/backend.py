@@ -24,6 +24,7 @@ Limitations relative to CodecSession:
 from __future__ import annotations
 
 import ctypes
+import os
 from typing import Optional
 
 import numpy as np
@@ -196,6 +197,27 @@ class DirectBackend:
         # Per-slot map-input-resource structs (filled lazily after registration).
         self._map_structs: list[NV_ENC_MAP_INPUT_RESOURCE] = []
 
+        # Optional native (C) hot-loop helper. OPT-IN via env var
+        # NVENC_DIRECT_NATIVE=1 — the C path is correct but doesn't beat
+        # the pre-bound Python loop on this hot path because NVENC's own
+        # submission-latency floor (~100us per EncodePicture call)
+        # dominates over the ctypes overhead. Kept in tree for future
+        # workloads where the pool depth or call rate make Python overhead
+        # the bottleneck again.
+        if os.environ.get("NVENC_DIRECT_NATIVE", "0") == "1":
+            from . import _native
+            self._native_lib = _native.get_lib()
+        else:
+            self._native_lib = None
+        self._native_ctx = None  # built on first encode (after _ensure_cuda_buf)
+        # Persistent destination buffer for native encode output. Grows on
+        # demand — zeroing 100+ MB per call would dominate per-frame time.
+        self._native_dest_buf = None
+        self._native_dest_cap = 0
+        self._native_offsets_arr = None
+        self._native_sizes_arr = None
+        self._native_offsets_cap = 0
+
     # ---- encode side ------------------------------------------------------
 
     def encode_frames(self, frames: np.ndarray) -> list[bytes]:
@@ -268,16 +290,154 @@ class DirectBackend:
             mp.registeredResource = rr.value if hasattr(rr, "value") else rr
             self._map_structs.append(mp)
 
+    def _build_native_ctx(self) -> None:
+        """Construct the C-side EncodeContext after the CUDA staging buffers
+        have been allocated and registered. Called once on the first encode."""
+        from . import _native
+        # Find function pointer addresses. ctypes function objects can be
+        # converted to raw addresses via ctypes.cast(fn, c_void_p).value.
+        def addr(fn):
+            return ctypes.cast(fn, ctypes.c_void_p).value or 0
+
+        # Resolve cuda driver memcpy functions through cuda-python
+        # The cuMemcpy*/cuStreamSync etc. APIs are ctypes-bound at the lib
+        # level; we want raw addresses. cuda.bindings.driver provides them
+        # but doesn't expose addresses directly. Easiest: load nvcuda.dll
+        # ourselves and resolve symbols via GetProcAddress.
+        nvcuda = ctypes.CDLL("nvcuda.dll")
+        fn_memcpy_dtod = ctypes.cast(nvcuda.cuMemcpyDtoD_v2, ctypes.c_void_p).value or 0
+        fn_memcpy_dtod_async = ctypes.cast(nvcuda.cuMemcpyDtoDAsync_v2, ctypes.c_void_p).value or 0
+
+        # NVENC function pointers come from the API table (already integers)
+        # via the same table we pre-bound CFUNCTYPE wrappers from.
+        # The table holds raw void* pointers in its struct fields.
+        t = self._table
+
+        ctx = _native.EncodeContext()
+        ctx.fn_map = t.nvEncMapInputResource
+        ctx.fn_unmap = t.nvEncUnmapInputResource
+        ctx.fn_encode = t.nvEncEncodePicture
+        ctx.fn_lock = t.nvEncLockBitstream
+        ctx.fn_unlock = t.nvEncUnlockBitstream
+        ctx.fn_memcpy_dtod = fn_memcpy_dtod
+        ctx.fn_memcpy_dtod_async = fn_memcpy_dtod_async
+
+        ctx.encoder = self._encoder.value if hasattr(self._encoder, "value") else self._encoder
+        ctx.cuda_stream = self._user_stream if self._user_stream else 0
+
+        ctx.pool_size = self._output_pool_size
+        ctx.per_frame_bytes = self._cuda_buf_size
+
+        # Per-slot CUDA dst pointers (uint64 array)
+        n = self._output_pool_size
+        DstArrT = ctypes.c_uint64 * n
+        self._native_dst_arr = DstArrT(*self._cuda_bufs)
+        ctx.slot_dst_ptrs = self._native_dst_arr
+
+        # Per-slot output bitstream handles
+        OutArrT = ctypes.c_void_p * n
+        self._native_out_arr = OutArrT(
+            *(b.value if hasattr(b, "value") else b for b in self._out_pool)
+        )
+        ctx.out_buffers = self._native_out_arr
+
+        # Per-slot map struct pointers (addresses of pre-allocated structs)
+        MapArrT = ctypes.c_void_p * n
+        self._native_map_arr = MapArrT(
+            *(ctypes.addressof(m) for m in self._map_structs)
+        )
+        ctx.map_struct_ptrs = self._native_map_arr
+        ctx.map_mapped_resource_offset = NV_ENC_MAP_INPUT_RESOURCE.mappedResource.offset
+
+        # Pic params struct + field offsets
+        ctx.pic_struct_ptr = ctypes.addressof(self._pic)
+        ctx.pic_inputBuffer_offset = NV_ENC_PIC_PARAMS.inputBuffer.offset
+        ctx.pic_outputBitstream_offset = NV_ENC_PIC_PARAMS.outputBitstream.offset
+        ctx.pic_encodePicFlags_offset = NV_ENC_PIC_PARAMS.encodePicFlags.offset
+
+        # Lock struct + field offsets
+        ctx.lock_struct_ptr = ctypes.addressof(self._lock)
+        ctx.lock_outputBitstream_offset = NV_ENC_LOCK_BITSTREAM.outputBitstream.offset
+        ctx.lock_bitstreamSizeInBytes_offset = NV_ENC_LOCK_BITSTREAM.bitstreamSizeInBytes.offset
+        ctx.lock_bitstreamBufferPtr_offset = NV_ENC_LOCK_BITSTREAM.bitstreamBufferPtr.offset
+
+        # IDR + SPSPPS flags constant
+        ctx.flags_idr = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS
+
+        self._native_ctx = ctx
+
+    def _encode_tensor_frames_native(self, tensor, N, per_frame_bytes, K):
+        """Run the encode hot loop in C. Returns list of packet bytes."""
+        if self._native_ctx is None:
+            self._build_native_ctx()
+
+        # Build src_ptrs array vectorized via numpy
+        base = int(tensor.data_ptr())
+        stride = per_frame_bytes
+        src_np = np.arange(N, dtype=np.uint64) * np.uint64(stride) + np.uint64(base)
+        src_ptr = src_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64))
+
+        # Reuse persistent dest buffer. Grow on demand. Heuristic: assume
+        # at least 4x compression — N * per_frame_bytes / 4 is a generous
+        # cap (real ratio at QP=18 is 30x+; this gives 7x headroom). Any
+        # call that overflows will retry with the input-sized cap.
+        needed_cap = max(N * per_frame_bytes // 4, 4 * 1024 * 1024)
+        if self._native_dest_buf is None or self._native_dest_cap < needed_cap:
+            self._native_dest_buf = (ctypes.c_uint8 * needed_cap)()
+            self._native_dest_cap = needed_cap
+        if self._native_offsets_arr is None or self._native_offsets_cap < N:
+            self._native_offsets_arr = (ctypes.c_uint32 * N)()
+            self._native_sizes_arr = (ctypes.c_uint32 * N)()
+            self._native_offsets_cap = N
+
+        dest_buf = self._native_dest_buf
+        dest_cap = self._native_dest_cap
+        offsets = self._native_offsets_arr
+        sizes = self._native_sizes_arr
+        dest_addr = ctypes.addressof(dest_buf)
+
+        rc = self._native_lib.encode_batch(
+            ctypes.byref(self._native_ctx),
+            N,
+            src_ptr,
+            ctypes.cast(dest_buf, ctypes.c_void_p),
+            dest_cap,
+            offsets,
+            sizes,
+        )
+        del src_np  # keep alive across call
+        if rc == 1:
+            # Retry once with full input-sized cap
+            needed_cap = N * per_frame_bytes
+            self._native_dest_buf = (ctypes.c_uint8 * needed_cap)()
+            self._native_dest_cap = needed_cap
+            dest_buf = self._native_dest_buf
+            dest_addr = ctypes.addressof(dest_buf)
+            rc = self._native_lib.encode_batch(
+                ctypes.byref(self._native_ctx),
+                N, src_ptr,
+                ctypes.cast(dest_buf, ctypes.c_void_p),
+                needed_cap, offsets, sizes,
+            )
+            if rc != 0:
+                raise RuntimeError(f"native encode_batch failed (after grow) rc={rc}")
+        elif rc != 0:
+            raise RuntimeError(f"native encode_batch failed with code {rc}")
+
+        out: list[bytes] = [
+            ctypes.string_at(dest_addr + offsets[i], sizes[i])
+            for i in range(N)
+        ]
+        return out
+
     def encode_tensor_frames(self, tensor: torch.Tensor) -> list[bytes]:
         """Encode N frames from a CUDA torch tensor — no host-side copy.
 
         Tensor shape: [N, 3, H, W] uint8, contiguous, on CUDA.
-        Per frame the path is:
-          1. cuMemcpyDtoD from tensor[i].data_ptr to our registered staging buffer
-          2. nvEncMapInputResource → mappedResource
-          3. nvEncEncodePicture (FORCEIDR on i==0)
-          4. nvEncLockBitstream / read / unlock
-          5. nvEncUnmapInputResource
+
+        Uses the native C encode-loop helper when available (closes the
+        per-frame Python overhead); falls back to the pure-Python pre-bound
+        loop otherwise.
 
         The D2D memcpy is GPU-internal (no PCIe) so this is the closest the
         encoder gets to "true" zero-copy without us hijacking the tensor's
@@ -301,6 +461,11 @@ class DirectBackend:
         N = tensor.shape[0]
         per_frame_bytes = self._cuda_buf_size
         K = self._output_pool_size
+
+        # Native fast path — runs the per-frame loop in C, bypassing the
+        # 6 ctypes calls per frame in the Python loop below.
+        if self._native_lib is not None:
+            return self._encode_tensor_frames_native(tensor, N, per_frame_bytes, K)
 
         # Bind everything we need into local names — local lookups are
         # ~5x faster than attribute lookups in CPython's hot loop.
