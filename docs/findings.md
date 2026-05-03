@@ -6,11 +6,49 @@ For the prior-art context (LLM.265, KVFetcher, CodecFlow) and what's specificall
 
 ## Quick navigation
 
+- [Codec backend speed (real workload)](#codec-backend-speed-on-real-flux-activations) — DirectBackend / MultiEngineDirectBackend latency
+- [Parallel-path overlap measurement](#parallel-path-overlap-measurement) — NVENC vs SM compute concurrency
 - [Compression Pareto curves](#diffusion-flux2-klein-9b-mid-double-block-activations) — what compression at what quality on diffusion + LLM
 - [Synthetic-data sanity controls](#synthetic-data-sanity-controls-poc01) — proof the pipeline isn't broken
 - [Cross-domain comparison](#whats-settled-across-both-domains) — diffusion vs LLM Pareto compared
 - [Codec subprocess overhead breakdown](#codec-subprocess-overhead-breakdown) — proving the fast-wrapper claim with numbers
 - [End-to-end wall-clock measurements](#end-to-end-wall-clock-measured-today) — what wins TODAY on which wires
+
+## Codec backend speed on real FLUX activations
+
+Workload: 4 captured FLUX.2 Klein 9B mid-block activations × K=500 LOO PCA = 668 frames at 256×256 YUV444 QP=18, RTX 5090. Reproducible via `python poc/18_real_activation_bench.py` after `python scripts/capture_diffusion.py`.
+
+![Codec backend latency](figures/encode_decode_bench.png)
+
+| Backend | encode ms/f | decode ms/f | mean cos | bytes (4 tensors) |
+|---|---|---|---|---|
+| PyAV CodecSession (1 engine) | 0.469 | 0.887 | 0.9731 | 4.39 MB |
+| PyAV MultiEngineCodecSession (1 engine effective in this serial pattern) | 0.443 | 0.949 | 0.9731 | 4.39 MB |
+| **DirectBackend (1 engine, pool=8, zero-copy)** | **0.243** | **0.435** | **0.9881** | **4.37 MB** |
+| **MultiEngineDirectBackend (3 engines × 8)** | **0.180** | **0.262** | **0.9881** | **4.37 MB** |
+
+End-to-end speedup vs the original FFmpeg subprocess baseline:
+
+![Speedup vs baselines](figures/speedup_vs_baselines.png)
+
+DirectBackend's quality bonus (cos 0.9881 vs 0.9731 at lower bitstream size) is explained in [`poc/19`](../poc/19_direct_vs_pyav_diff.py): PyAV's `pict_type=I` doesn't propagate to NVENC's `NV_ENC_PIC_FLAG_FORCEIDR` even with `forced_idr=1` set, so PyAV emits a P-frame referencing the warmup zero-frame (ffprobe even warns "Could not find ref with POC 0") while DirectBackend emits a clean IDR keyframe.
+
+## Parallel-path overlap measurement
+
+The headline architectural claim — that NVENC silicon runs concurrently with SM compute — is measured in [`poc/17`](../poc/17_parallel_path_demo.py):
+
+![Parallel-path overlap](figures/parallel_path_overlap.png)
+
+| | wall-clock (ms) |
+|---|---|
+| GEMM only (stream A) | 20.9 |
+| Encode only (stream B) | 19.9 |
+| Sum (no overlap) | 40.8 |
+| Theoretical max overlap floor | 20.9 |
+| Serialized (measured) | 40.1 |
+| **Parallel (measured)** | **26.0 — 1.34× speedup, 67% of max overlap realized** |
+
+The remaining ~33% gap to the theoretical ceiling is per-frame `lock_and_read_bitstream` blocking and Python ctypes overhead. The pre-bound Python loop (session 12) and the C extension (session 13) both attempt to close it; both find the actual floor is NVENC's own `EncodePicture` submission latency, not Python overhead.
 
 ## Diffusion: FLUX.2 Klein 9B mid-double-block activations
 

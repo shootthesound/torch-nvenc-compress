@@ -2,6 +2,15 @@
 
 Numbered for the recommended reading / running order.
 
+The headline numbers across the suite, on real FLUX activations (poc/18, RTX 5090):
+
+![Codec backend latency](../docs/figures/encode_decode_bench.png)
+
+![End-to-end speedup vs baselines](../docs/figures/speedup_vs_baselines.png)
+
+![Parallel-path overlap](../docs/figures/parallel_path_overlap.png)
+
+
 | # | Script | Demonstrates | Needs model? |
 |---|---|---|---|
 | 01 | [`01_synthetic_controls.py`](01_synthetic_controls.py) | Pipeline sanity: zeros 600×, smooth 70×, Gaussian noise ~4× | No |
@@ -19,10 +28,10 @@ Numbered for the recommended reading / running order.
 | 13 | [`13_direct_nvenc_scaffold.py`](13_direct_nvenc_scaffold.py) | Direct NVENC ctypes scaffold — loads driver-shipped nvEncodeAPI64.dll, calls NvEncodeAPICreateInstance, verifies the API table is populated and 39 function pointers map. | No |
 | 14 | [`14_direct_nvenc_first_frame.py`](14_direct_nvenc_first_frame.py) | First end-to-end NVENC encode through the direct ctypes path: init encoder, register input/output buffers, write a synthetic YUV444 frame, call nvEncEncodePicture, read out the HEVC bitstream. | No |
 | 15 | [`15_direct_nvdec_round_trip.py`](15_direct_nvdec_round_trip.py) | Full encode + decode round-trip through pure ctypes (NVENC + nvcuvid). Verifies PSNR > 30 dB after the round-trip — confirms the NVDEC binding is correct. | No |
-| 16 | [`16_direct_backend_bench.py`](16_direct_backend_bench.py) | DirectBackend bench vs PyAV CodecSession on synthetic frames. Measures the host-buffer path, the zero-copy CUDA-tensor path, and the round-trip diff. **Encode 0.22 ms/frame zero-copy vs 0.45 ms/frame PyAV (2.0×); decode 1.55 ms/frame vs 5.42 (3.4×).** | No |
-| 17 | [`17_parallel_path_demo.py`](17_parallel_path_demo.py) | The killer demo: GEMM on stream A + DirectBackend encode on stream B with `nvEncSetIOCudaStreams`. Measures **67% of theoretical-max overlap realized** — confirms NVENC silicon is independent of SM compute. | No |
-| 18 | [`18_real_activation_bench.py`](18_real_activation_bench.py) | Real-workload bench on captured FLUX.2 Klein 9B activations through the full PCA + quant + YUV pack pipeline. Compares pyav-single, pyav-multi, DirectBackend, and MultiEngineDirectBackend (3 engines). **End-to-end: 2.83× over PyAV CodecSession** at equal-or-better cos-sim quality. | Yes (FLUX captures from ring0/data/) |
-| 19 | [`19_direct_vs_pyav_diff.py`](19_direct_vs_pyav_diff.py) | Diagnoses the bitstream/quality divergence between DirectBackend and PyAV. ffprobes both bitstreams, walks Annex-B NAL units, finds the root cause: PyAV's `pict_type=I` doesn't propagate to NVENC's FORCEIDR flag. | No |
+| 16 | [`16_direct_backend_bench.py`](16_direct_backend_bench.py) | DirectBackend bench vs PyAV CodecSession on synthetic frames. Measures the host-buffer path, the zero-copy CUDA-tensor path with output ring + per-slot staging buffers, and zero-copy decode into a torch CUDA tensor. **Encode ~0.22 ms/frame zero-copy vs ~0.47 ms/frame PyAV (~2× single-engine); decode 1.4 ms/frame torch CUDA vs 5.4 ms/frame PyAV (~3.7×).** Set `NVENC_DIRECT_NATIVE=1` to opt into the C-extension hot loop (correct but doesn't beat the pre-bound Python loop on this hot path — see session 13 notes in `src/nvenc_compress/direct/__init__.py`). | No |
+| 17 | [`17_parallel_path_demo.py`](17_parallel_path_demo.py) | The killer demo: GEMM on stream A + DirectBackend encode on stream B with `nvEncSetIOCudaStreams`. Measures **67% of theoretical-max overlap realized** (1.34× speedup over serialized) — confirms NVENC silicon is independent of SM compute. | No |
+| 18 | [`18_real_activation_bench.py`](18_real_activation_bench.py) | Real-workload bench on captured FLUX.2 Klein 9B activations through the full PCA + quant + YUV pack pipeline. Compares pyav-single, pyav-multi, DirectBackend, and MultiEngineDirectBackend (3 engines). **End-to-end: 3.13–3.25× over PyAV CodecSession** (encode 0.180 ms/f, decode 0.262 ms/f with multi-engine + zero-copy decode) at equal-or-better cos-sim quality. **~7.9× over the original FFmpeg subprocess baseline.** | Yes (FLUX captures) |
+| 19 | [`19_direct_vs_pyav_diff.py`](19_direct_vs_pyav_diff.py) | Diagnoses the bitstream/quality divergence between DirectBackend and PyAV. ffprobes both bitstreams, walks Annex-B NAL units, finds the root cause: PyAV's `pict_type=I` doesn't propagate to NVENC's FORCEIDR flag — PyAV emits TRAIL_R (P-frame against the warmup zero-frame), DirectBackend emits IDR_W_RADL. | No (needs ffprobe on PATH) |
 
 ## Recommended order
 

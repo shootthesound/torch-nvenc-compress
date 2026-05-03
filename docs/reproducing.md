@@ -115,16 +115,16 @@ python scripts/capture_llm_kv.py --model mistralai/Mistral-7B-v0.3 --layer 16
 python scripts/capture_llm_kv.py --model Qwen/Qwen2.5-1.5B-Instruct --layer 14
 ```
 
-## 7. The bandwidth argument
+## 7. The bandwidth argument (PyAV-era PoCs)
 
 ```bash
 python poc/06_pcie_microbench.py             # ~30 sec — codec round-trip vs PCIe
-python poc/07_parallel_path_demo.py          # ~1-2 min — pipelined cuda streams
+python poc/07_parallel_path_demo.py          # ~1-2 min — pipelined cuda streams (PyAV path)
 python poc/08_wire_simulation.py             # ~1 min — end-to-end across simulated wires
 python poc/09_dual_lane.py                   # ~3-5 min — dual-lane parallel offload
 python poc/10_codec_overhead_breakdown.py    # ~30 sec — proves subprocess overhead is the bottleneck
-python poc/11_codec_session_bench.py         # ~5 min — CodecSession (persistent NVENC) vs per-call backends, multiple batch sizes
-python poc/12_multi_engine_bench.py          # ~5 min — MultiEngineCodecSession parallel across the GPU's NVENC engines
+python poc/11_codec_session_bench.py         # ~5 min — CodecSession (persistent NVENC) vs per-call backends
+python poc/12_multi_engine_bench.py          # ~5 min — MultiEngineCodecSession parallel across NVENC engines
 ```
 
 What to expect:
@@ -134,11 +134,50 @@ What to expect:
 - **`08_wire_simulation.py`** — measures REAL codec time + simulates wire transmission. Shows codec **winning today** on residential broadband (~3-5×) even with the slow pipeline. Loses on PCIe / 10 Gbit / 1 Gbit.
 - **`09_dual_lane.py`** — runs direct PCIe and codec lanes concurrently on cuda streams. Shows ~1.7× wall-clock speedup on simulated 1 Gbit ethernet, ~2× on 100 Mbps, even with the slow pipeline.
 - **`10_codec_overhead_breakdown.py`** — decomposes the 258 ms encode round-trip: ~171 ms (66%) is subprocess overhead, ~87 ms (34%) is real codec + I/O. Proves that an in-process wrapper (PyAV) would close the bulk of the gap without algorithmic changes.
-- **`11_codec_session_bench.py`** — measured comparison of subprocess / per-call PyAV / CodecSession across batch sizes 1-16 on real PCA-rotated activations. CodecSession gives 1.77× speedup over subprocess and 1.45× over per-call PyAV by holding the NVENC encoder context open across multiple `compress()` calls. Quality slightly better, bitstream ~22% larger at same QP (offset by bumping QP a few notches).
+- **`11_codec_session_bench.py`** — measured comparison of subprocess / per-call PyAV / CodecSession across batch sizes 1-16 on real PCA-rotated activations. CodecSession gives 1.77× speedup over subprocess.
+- **`12_multi_engine_bench.py`** — MultiEngineCodecSession across the 5090's 3 NVENC engines via Python threads. 2.81× speedup over subprocess on batch workloads.
 
-Together these PoCs let you reproduce both the wins-today claims (slow wires, dual-lane) and the wins-with-fast-wrapper projections (PCIe, multi-GPU NVLink-replacement). See [`docs/parallel_path.md`](parallel_path.md) for the full math.
+## 8. Direct Video Codec SDK path (`DirectBackend`)
 
-## 8. Null findings (~5 min total, optional)
+The fast path that the headline numbers come from. Pure-ctypes against the driver-shipped `nvEncodeAPI64.dll` + `nvcuvid.dll`. No PyAV, no PyNvVideoCodec, no FFmpeg subprocess in the codec path.
+
+```bash
+python poc/13_direct_nvenc_scaffold.py       # ~5 sec — open + destroy lifecycle, GUID enum
+python poc/14_direct_nvenc_first_frame.py    # ~5 sec — first end-to-end encode via direct path
+python poc/15_direct_nvdec_round_trip.py     # ~10 sec — adds NVDEC for full round-trip
+python poc/16_direct_backend_bench.py        # ~30 sec — DirectBackend vs PyAV on synthetic frames
+python poc/17_parallel_path_demo.py          # ~10 sec — NVENC encode concurrent with GEMM (1.34×)
+python poc/18_real_activation_bench.py       # ~30 sec — real FLUX activation bench (3.13× e2e)
+python poc/19_direct_vs_pyav_diff.py         # ~10 sec — diagnoses the bitstream/quality divergence
+```
+
+What to expect:
+
+- **`13` → `15`** — build-up: scaffold, first frame, NVENC + NVDEC round-trip with PSNR > 30 dB.
+- **`16_direct_backend_bench.py`** — small synthetic batch. DirectBackend zero-copy at 0.22 ms/f encode (1.5–2× over PyAV); decode at 1.35 ms/f via torch CUDA tensor (3–4× over PyAV).
+- **`17_parallel_path_demo.py`** — GEMM on stream A + DirectBackend encode on stream B simultaneously. Reports overlap fraction realised (~67% of theoretical max).
+- **`18_real_activation_bench.py`** — real FLUX captures through the full pipeline. Compares pyav-single, pyav-multi, DirectBackend, MultiEngineDirectBackend. End-to-end **2.83–3.25× over PyAV CodecSession**, **~7.9× over FFmpeg subprocess**.
+- **`19_direct_vs_pyav_diff.py`** — bitstream forensics: shows PyAV emits TRAIL_R where DirectBackend emits IDR_W_RADL.
+
+### Optional: build the C extension for the encode hot loop
+
+Requires Visual Studio Build Tools 2019+ on Windows (the C compiler is auto-detected via setuptools' `_msvccompiler`) or `gcc` on Linux. The compile is one-shot at first import and the resulting DLL is cached under `~/.cache/torch-nvenc-compress/`.
+
+```bash
+NVENC_DIRECT_NATIVE=1 python poc/16_direct_backend_bench.py
+```
+
+Note: the C extension is correct (round-trip diff matches the pure-Python path) but does NOT materially beat the pre-bound Python loop on real workloads — NVENC's own `EncodePicture` submission latency floor (~100 µs/call) dominates. Kept as opt-in infrastructure for future workloads where Python overhead might become the bottleneck again.
+
+## 9. Regenerate the README figures
+
+```bash
+python scripts/generate_figures.py           # writes PNGs to docs/figures/
+```
+
+The figures are committed so casual readers see them on GitHub without running anything. Re-generate after big bench changes.
+
+## 10. Null findings (~5 min total, optional)
 
 ```bash
 python poc/null_findings/n1_sparse_residual.py

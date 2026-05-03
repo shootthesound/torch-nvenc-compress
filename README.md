@@ -14,26 +14,40 @@ For multi-GPU on consumer hardware (the 5090 has no NVLink), this approximately 
 
 The full NVLink-replacement claim ("180 GB/s effective cross-GPU bandwidth on the 5090 via NVENC + PCIe") breaks into four building blocks. Three are validated with measurements; the fourth is hardware-blocked.
 
+![NVLink replacement status](docs/figures/nvlink_status.png)
+
 | Building block | Status | Where it's measured |
 |---|---|---|
 | **6× lossless compression on diffusion activations** | ✅ DONE — 6.1× cos 0.991 LOO across 1,735 captures | [`docs/findings.md`](docs/findings.md) |
-| **Codec latency low enough to hide behind PCIe transfer** | ✅ DONE — 0.179 ms/frame encode, 0.301 ms/frame decode (`MultiEngineDirectBackend`, real activations) | [`poc/18`](poc/18_real_activation_bench.py) |
+| **Codec latency low enough to hide behind PCIe transfer** | ✅ DONE — 0.180 ms/frame encode, 0.262 ms/frame decode (`MultiEngineDirectBackend`, real activations) | [`poc/18`](poc/18_real_activation_bench.py) |
 | **NVENC silicon runs concurrently with SM compute** | ✅ DONE — 67% of theoretical-max parallel-path overlap measured (1.34× over serialized GEMM + encode) | [`poc/17`](poc/17_parallel_path_demo.py) |
 | **Cross-GPU PCIe peer-to-peer integration** | ❌ NOT YET — single-GPU validation rig only; encoder zero-copy + stream binding ready, P2P wiring is the remaining engineering. **Blocked on a second GPU** (4090 laptop incoming). | — |
 
 The codec primitive, the compression ratio, and the architectural parallel-path claim are all measured on a 5090 with real workloads. The remaining 25% is plumbing — no new physics, just integration once the second GPU is in the rig.
 
-### Speed today vs the previous fast path (PyAV CodecSession)
+### Speed today
 
 Real FLUX activations, 668 frames, K=500, QP=18, RTX 5090:
+
+![Codec backend latency](docs/figures/encode_decode_bench.png)
 
 | Backend | encode ms/frame | decode ms/frame | end-to-end vs PyAV |
 |---|---|---|---|
 | PyAV CodecSession (the previous fast path) | 0.469 | 0.887 | 1.0× baseline |
-| `DirectBackend` (1 NVENC engine, pool=8) | 0.243 | 0.493 | **1.84×** |
-| **`MultiEngineDirectBackend` (3 NVENC engines × pool=8)** | **0.179** | **0.301** | **2.83×** |
+| `DirectBackend` (1 NVENC engine, pool=8) | 0.243 | 0.435 | **2.10×** |
+| **`MultiEngineDirectBackend` (3 NVENC engines × pool=8)** | **0.180** | **0.262** | **3.25×** |
 
-vs the original FFmpeg subprocess baseline: **~7.9× faster end-to-end** with `MultiEngineDirectBackend`. Plus a quality bonus (cos 0.9881 vs 0.9731) at slightly smaller bitstream — DirectBackend emits proper IDR keyframes where PyAV emits P-frames against a stale warmup reference (diagnosed in [`poc/19`](poc/19_direct_vs_pyav_diff.py)).
+End-to-end speedup vs the original FFmpeg subprocess baseline:
+
+![End-to-end speedup vs baselines](docs/figures/speedup_vs_baselines.png)
+
+Plus a quality bonus (cos 0.9881 vs 0.9731) at slightly smaller bitstream — `DirectBackend` emits proper IDR keyframes where PyAV emits P-frames against a stale warmup reference (diagnosed in [`poc/19`](poc/19_direct_vs_pyav_diff.py)).
+
+### The parallel-path claim (NVENC silicon is independent of SM compute)
+
+![Parallel-path overlap](docs/figures/parallel_path_overlap.png)
+
+`poc/17` runs a 30×4096² fp16 GEMM on stream A and a 64-frame encode on stream B (encoder bound to stream B via `nvEncSetIOCudaStreams`). The streams overlap measurably: parallel wall-clock is 26.0 ms vs serialized 40.1 ms — **1.34× speedup, 67% of the theoretical max overlap realized.** This is what makes the bandwidth-amplification table at the bottom of this README a measurement and not just math.
 
 ---
 
@@ -51,6 +65,10 @@ With NVENC compression pipelined into the cross-GPU activation transfer:
 | H100 SXM (NVLink 4, datacenter) | 900 GB/s | (already has it) |
 
 **180 GB/s is roughly 3× the per-direction NVLink-3 bandwidth of the 3090.** On consumer hardware NVIDIA explicitly nerfed for multi-GPU ML use. Using compute that already exists on the GPU and currently sits idle. For free.
+
+The same 6× compression ratio multiplies the effective bandwidth of every other wire on the system too:
+
+![Bandwidth amplification across wires](docs/figures/bandwidth_amplification.png)
 
 This is the load-bearing claim of this project. The diffusion / LLM compression PoCs are the building blocks; the multi-GPU consumer-hardware unlock is the application that matters most.
 
@@ -221,6 +239,36 @@ python poc/01_synthetic_controls.py                      # no model download req
 
 The synthetic-controls PoC is a 2-minute pipeline sanity check (zeros → ~600× compression, smooth-per-channel → ~75×, pure noise → ~4×). It tells you the toolchain works before you commit to downloading multi-GB models.
 
+### Using `DirectBackend` from your own code
+
+```python
+import torch
+from nvenc_compress.direct import DirectBackend
+from nvenc_compress.direct.multi_backend import MultiEngineDirectBackend
+
+# Single engine — drop-in for CodecSession
+backend = DirectBackend(height=256, width=256, qp=18)
+
+# Frames must be CUDA tensors, [N, 3, H, W] uint8 (YUV444 planar layout)
+frames = torch.randint(0, 255, (16, 3, 256, 256), dtype=torch.uint8, device="cuda")
+
+packets = backend.encode_tensor_frames(frames)        # list[bytes], one per frame
+decoded = backend.decode_frames_cuda(packets, 16)      # torch.Tensor on CUDA — no host hop
+backend.close()
+
+# Three NVENC engines on the 5090 in parallel — same interface
+multi = MultiEngineDirectBackend(height=256, width=256, qp=18, n_engines=3)
+batched_packets = multi.encode_tensor_batch([frames, frames, frames])  # list[list[bytes]]
+multi.close()
+```
+
+Bind a CUDA stream so encode runs concurrently with your model's compute:
+
+```python
+stream = torch.cuda.Stream()
+backend = DirectBackend(height=256, width=256, qp=18, cuda_stream=stream.cuda_stream)
+```
+
 ## Reproducing the full Pareto curves
 
 ```bash
@@ -266,17 +314,25 @@ Step-by-step in [`docs/reproducing.md`](docs/reproducing.md).
 ## What's in this repo
 
 ```
-src/nvenc_compress/         # Small reusable Python package: codec wrapper, PCA basis,
-                            # quantize/dequantize, end-to-end compress/decompress
-src/nvenc_compress/direct/  # Pure-ctypes bindings against driver NVENC + NVDEC DLLs
-                            # (no PyAV / PyNvVideoCodec / FFmpeg subprocess in the
-                            # codec path). DirectBackend class with zero-copy CUDA,
-                            # 8-deep async output pool, and CUDA stream binding.
-scripts/                    # Environment check, model downloads, capture (hooks for
-                            # diffusion + LLM models)
-poc/                        # 18 numbered proofs-of-concept demonstrating each finding
-poc/null_findings/          # 3 things we tried that DIDN'T crack the Pareto open
-docs/                       # Findings tables, parallel-path reframe, reproducing guide
+src/nvenc_compress/                # Reusable Python package: codec wrappers, PCA basis,
+                                   # quantize/dequantize, end-to-end compress/decompress
+src/nvenc_compress/direct/         # Pure-ctypes bindings against driver NVENC + NVDEC DLLs
+                                   # (no PyAV / PyNvVideoCodec / FFmpeg subprocess in the
+                                   # codec path). DirectBackend class with zero-copy CUDA,
+                                   # 8-deep async output pool, CUDA stream binding,
+                                   # MultiEngineDirectBackend across 3 hardware NVENC engines.
+src/nvenc_compress/direct/_encode_loop.c   # Optional C extension for the encode hot loop
+src/nvenc_compress/direct/_native.py       # Build harness — compiles the .c on first import
+                                           # via setuptools' MSVC wrapper; opt in with
+                                           # NVENC_DIRECT_NATIVE=1 (doesn't beat the pre-bound
+                                           # Python loop on the current hot path; kept as
+                                           # infrastructure for future workloads)
+scripts/                           # Environment check, model downloads, capture, figures
+poc/                               # 19 numbered proofs-of-concept demonstrating each finding
+poc/null_findings/                 # 3 things we tried that DIDN'T crack the Pareto open
+docs/                              # Findings tables, parallel-path reframe, reproducing guide
+docs/figures/                      # PNGs referenced from the READMEs (regenerable via
+                                   # `python scripts/generate_figures.py`)
 ```
 
 ## Other honest caveats

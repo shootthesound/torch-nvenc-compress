@@ -2,6 +2,10 @@
 
 The single most important architectural observation in this repo. If you only read one doc page, read this one.
 
+![Parallel-path overlap measurement](figures/parallel_path_overlap.png)
+
+The figure above is the killer measurement, [`poc/17`](../poc/17_parallel_path_demo.py): a 64-frame `DirectBackend.encode_tensor_frames` call running on stream B (encoder bound via `nvEncSetIOCudaStreams`) is concurrent with a 30×4096² fp16 GEMM on stream A. Wall-clock collapses from 40.1 ms (sum) to 26.0 ms (parallel) — **1.34× speedup, 67% of the theoretical max overlap realized.** This is what makes the rest of this document a measurement and not just math.
+
 ## What's actually idle on a GPU during ML inference
 
 | Hardware unit | Used by inference? |
@@ -76,7 +80,13 @@ effective_cross_GPU_bandwidth = PCIe_real * compression_ratio
 
 So: **NVENC + PCIe with pipelining approximately recovers NVLink-3-class effective bandwidth on cards where NVIDIA explicitly removed the link.** Using compute that already exists on the GPU. For free.
 
+The same multiplier applies to every other wire on the system — the codec hardware is per-GPU, but the bandwidth amplification follows the data wherever it goes:
+
+![Bandwidth amplification across wires](figures/bandwidth_amplification.png)
+
 ### Where the claim stands today (~75% validated)
+
+![NVLink replacement claim status](figures/nvlink_status.png)
 
 The claim breaks into four building blocks. Three are done; the fourth is hardware-blocked.
 
@@ -154,15 +164,17 @@ NVIDIA's Video Codec SDK provides the lowest-level C API to NVENC and NVDEC. We 
 
 **Measured speed on real FLUX activations (poc/18, 668 frames @ 256×256 YUV444 QP=18):**
 
+![Codec backend latency](figures/encode_decode_bench.png)
+
 | Backend | encode ms/frame | decode ms/frame | end-to-end vs PyAV |
 |---|---|---|---|
 | PyAV CodecSession (the previous fast path) | 0.469 | 0.887 | 1.0× baseline |
-| DirectBackend (1 engine, pool=8) | 0.243 | 0.493 | **1.84×** |
-| **MultiEngineDirectBackend (3 engines × 8)** | **0.179** | **0.301** | **2.83×** |
+| DirectBackend (1 engine, pool=8) | 0.243 | 0.435 | **2.10×** |
+| **MultiEngineDirectBackend (3 engines × 8)** | **0.180** | **0.262** | **3.25×** |
 
 vs the original FFmpeg subprocess baseline:
-- DirectBackend: ~5.2× faster
-- MultiEngineDirectBackend: ~7.9× faster
+
+![Speedup vs baselines](figures/speedup_vs_baselines.png)
 
 **Bonus quality**: DirectBackend produces cos 0.9881 vs PyAV's 0.9731 on real activations at the same QP, with slightly smaller bitstream. Diagnosed in [`poc/19`](../poc/19_direct_vs_pyav_diff.py): PyAV's `pict_type=I` doesn't propagate to NVENC's `NV_ENC_PIC_FLAG_FORCEIDR`, so PyAV emits TRAIL_R (P-frame referencing the warmup zero-frame) where DirectBackend emits a clean IDR_W_RADL. ffprobe even warns "Could not find ref with POC 0" on PyAV bitstreams.
 
