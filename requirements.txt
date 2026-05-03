@@ -1,0 +1,12 @@
+# Core (always required)
+torch>=2.4
+numpy>=1.26
+
+# For diffusion captures (FLUX.1 via diffusers)
+diffusers>=0.30
+transformers>=4.45
+accelerate>=0.30
+huggingface_hub>=0.25
+safetensors>=0.4
+sentencepiece>=0.2
+protobuf>=4.25

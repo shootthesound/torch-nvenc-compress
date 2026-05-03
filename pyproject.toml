@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nvenc-compress"
+version = "0.1.0"
+description = "Compress neural network activations with the GPU's idle NVENC silicon"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Peter Neill", email = "peter@shootthesound.com" },
+]
+keywords = [
+    "nvenc", "compression", "activations", "kv-cache",
+    "diffusion", "llm", "pcie", "bandwidth",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+diffusion = [
+    "diffusers>=0.30",
+    "transformers>=4.45",
+    "accelerate>=0.30",
+    "huggingface_hub>=0.25",
+    "safetensors>=0.4",
+    "sentencepiece>=0.2",
+    "protobuf>=4.25",
+]
+llm = [
+    "transformers>=4.45",
+    "accelerate>=0.30",
+    "huggingface_hub>=0.25",
+    "safetensors>=0.4",
+    "sentencepiece>=0.2",
+]
+# In-process FFmpeg via PyAV — eliminates subprocess overhead for ~1.2x
+# speedup on the codec round-trip. Works with the bundled FFmpeg (av>=14
+# wheels include hevc_nvenc / hevc_cuvid).
+pyav = [
+    "av>=14",
+]
+all = ["nvenc-compress[diffusion,llm,pyav]"]
+
+[project.urls]
+Homepage = "https://github.com/shootthesound/torch-nvenc-compress"
+
+[tool.setuptools.packages.find]
+where = ["src"]
