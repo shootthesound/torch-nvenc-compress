@@ -28,7 +28,11 @@ from nvenc_compress import build_shared_basis, compress, decompress, CodecSessio
 
 DATA_DIR_DIFFUSION = Path("data/diffusion")
 DATA_DIR_KV = Path("data/kv")
-RING0_FALLBACK = Path(r"W:\Peter\Documents\Development\NVENC Activations\ring0\data")
+# Optional fallback: if the new public capture dirs are empty, look in
+# RING0_DATA_DIR (used by the project author's internal research scratchpad).
+# Set this env var if you have your own captures parked elsewhere.
+import os as _os
+RING0_FALLBACK = Path(_os.environ.get("RING0_DATA_DIR", "ring0/data"))
 K = 1000
 QP = 18
 BATCH_SIZES = [1, 2, 4, 8, 16]

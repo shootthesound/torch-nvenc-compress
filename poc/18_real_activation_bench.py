@@ -32,7 +32,14 @@ from nvenc_compress.direct.backend import DirectBackend
 from nvenc_compress.direct.multi_backend import MultiEngineDirectBackend
 
 
-DATA_DIR = Path("W:/Peter/Documents/Development/NVENC Activations/ring0/data")
+# Where to find captured FLUX activations. Default: relative ./data/diffusion/
+# (where scripts/capture_diffusion.py writes them). Override via env var if you
+# have captures parked elsewhere.
+import os as _os
+DATA_DIR = Path(_os.environ.get(
+    "NVENC_COMPRESS_CAPTURES",
+    _os.environ.get("RING0_DATA_DIR", "data/diffusion"),
+))
 N_CALIB = 16        # number of activations to build PCA basis from
 N_HOLDOUT = 4       # number of activations to bench codec on
 K = 500             # PCA rank
