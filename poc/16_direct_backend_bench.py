@@ -71,27 +71,22 @@ def bench_direct(frames: np.ndarray) -> tuple[float, float, list[bytes], np.ndar
         backend.close()
 
 
-def bench_direct_zero_copy(frames: np.ndarray) -> tuple[float, list[bytes]]:
-    """encode_tensor_frames path — input is a CUDA tensor; the only host
-    work is the initial CPU->GPU copy of the test frames (which we do
-    once outside the timed region)."""
+def bench_direct_zero_copy(frames: np.ndarray) -> tuple[float, float, list[bytes]]:
+    """Zero-copy encode + decode: input/output are CUDA tensors."""
     print("\n[direct/zerocopy] DirectBackend init...")
     t0 = time.perf_counter()
     backend = DirectBackend(height=H, width=W, qp=QP)
     init_ms = (time.perf_counter() - t0) * 1000
     print(f"    init: {init_ms:.1f} ms")
     try:
-        # Stage frames on GPU once (NOT counted toward encode time — same way
-        # PyAV / DirectBackend host paths assume the data is already in RAM)
         cuda_frames = torch.from_numpy(frames).cuda().contiguous()
         torch.cuda.synchronize()
 
-        # Warmup encode (registers CUDA buffer + maps once) — pay one-time cost
-        # outside the measurement
+        # Warmup encode (registers CUDA buffer + maps once)
         _ = backend.encode_tensor_frames(cuda_frames[:1])
-
-        # Real timed encode of the full batch
         torch.cuda.synchronize()
+
+        # Encode timing
         t0 = time.perf_counter()
         packets = backend.encode_tensor_frames(cuda_frames)
         torch.cuda.synchronize()
@@ -100,7 +95,24 @@ def bench_direct_zero_copy(frames: np.ndarray) -> tuple[float, list[bytes]]:
         print(f"    encode {len(packets)} packets in {enc_ms:.1f} ms "
               f"({enc_ms / max(1, len(packets)):.2f} ms/frame, "
               f"{total_bytes} bytes total)")
-        return enc_ms, packets
+
+        # Warmup decode (allocates the output torch tensor + first frame)
+        _ = backend.decode_frames_cuda(packets[:1], 1)
+        torch.cuda.synchronize()
+
+        # Decode timing — zero-copy into torch CUDA tensor
+        t0 = time.perf_counter()
+        decoded_cuda = backend.decode_frames_cuda(packets, N_FRAMES)
+        torch.cuda.synchronize()
+        dec_ms = (time.perf_counter() - t0) * 1000
+        print(f"    decode {N_FRAMES} frames in {dec_ms:.1f} ms "
+              f"({dec_ms / N_FRAMES:.2f} ms/frame, into torch CUDA tensor)")
+
+        # Sanity: round-trip diff
+        diff = (decoded_cuda.to(torch.int32) - cuda_frames.to(torch.int32)).abs()
+        print(f"    zero-copy round-trip diff: max={diff.max().item()} "
+              f"mean={diff.float().mean().item():.3f}")
+        return enc_ms, dec_ms, packets
     finally:
         backend.close()
 
@@ -157,32 +169,24 @@ def main() -> int:
     diffs = np.abs(decoded_d.astype(np.int32) - frames.astype(np.int32))
     print(f"\n[direct] round-trip diff: max={diffs.max()} mean={diffs.mean():.3f}")
 
-    enc_z, pkts_z = zero_result
-
-    # Quick correctness check: decode the zero-copy bitstream and verify
-    # it round-trips against the same input
-    print("\n[direct/zerocopy] decode-back sanity check...")
-    sanity_backend = DirectBackend(height=H, width=W, qp=QP)
-    try:
-        decoded_z = sanity_backend.decode_frames(pkts_z, N_FRAMES)
-    finally:
-        sanity_backend.close()
-    diffs_z = np.abs(decoded_z.astype(np.int32) - frames.astype(np.int32))
-    print(f"    zero-copy round-trip diff: max={diffs_z.max()} mean={diffs_z.mean():.3f}")
+    enc_z, dec_z, pkts_z = zero_result
 
     print("\n--- summary ---")
-    print(f"direct encode (host buf):    {enc_d:.1f} ms  ({enc_d / N_FRAMES:.2f} ms/frame)")
-    print(f"direct encode (zero-copy):   {enc_z:.1f} ms  ({enc_z / N_FRAMES:.2f} ms/frame)")
-    print(f"direct decode:               {dec_d:.1f} ms  ({dec_d / N_FRAMES:.2f} ms/frame)")
+    print(f"direct encode (host buf):       {enc_d:.1f} ms  ({enc_d / N_FRAMES:.2f} ms/frame)")
+    print(f"direct encode (zero-copy):      {enc_z:.1f} ms  ({enc_z / N_FRAMES:.2f} ms/frame)")
+    print(f"direct decode (numpy / DtoH):   {dec_d:.1f} ms  ({dec_d / N_FRAMES:.2f} ms/frame)")
+    print(f"direct decode (torch CUDA, D2D):{dec_z:.1f} ms  ({dec_z / N_FRAMES:.2f} ms/frame)")
     if pyav_result is not None:
         enc_p, dec_p, _, decoded_p = pyav_result
         print(f"pyav encode:                 {enc_p:.1f} ms  ({enc_p / N_FRAMES:.2f} ms/frame)")
         print(f"pyav decode:                 {dec_p:.1f} ms  ({dec_p / N_FRAMES:.2f} ms/frame)")
         if enc_d > 0:
-            print(f"\nencode speedup (pyav / direct host):     {enc_p / enc_d:.2f}x")
-            print(f"encode speedup (pyav / direct zero-copy):{enc_p / enc_z:.2f}x")
-            print(f"encode speedup (host / zero-copy):       {enc_d / enc_z:.2f}x")
-            print(f"decode speedup (pyav / direct):          {dec_p / dec_d:.2f}x")
+            print(f"\nencode speedup (pyav / direct host):       {enc_p / enc_d:.2f}x")
+            print(f"encode speedup (pyav / direct zero-copy):  {enc_p / enc_z:.2f}x")
+            print(f"encode speedup (host / zero-copy):         {enc_d / enc_z:.2f}x")
+            print(f"decode speedup (pyav / numpy):             {dec_p / dec_d:.2f}x")
+            print(f"decode speedup (pyav / torch zero-copy):   {dec_p / dec_z:.2f}x")
+            print(f"decode speedup (numpy / torch zero-copy):  {dec_d / dec_z:.2f}x")
         # Sanity: both should produce visually-identical reconstructions
         diffs_p = np.abs(decoded_p.astype(np.int32) - frames.astype(np.int32))
         print(f"pyav round-trip diff:   max={diffs_p.max()} mean={diffs_p.mean():.3f}")

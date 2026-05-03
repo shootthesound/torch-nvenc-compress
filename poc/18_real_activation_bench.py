@@ -159,10 +159,22 @@ def bench_direct_multi(holdout_frames, padded_h, padded_w, n_frames_per, n_engin
         torch.cuda.synchronize()
         enc_ms = (time.perf_counter() - t0) * 1000
 
+        # Decode timing — also measure the new zero-copy CUDA-tensor decode
         t0 = time.perf_counter()
         all_decoded = multi.decode_frames_batch(all_packets, n_frames_per)
         dec_ms = (time.perf_counter() - t0) * 1000
-        return enc_ms, dec_ms, all_packets, all_decoded
+
+        t0 = time.perf_counter()
+        decoded_cuda = multi.decode_frames_cuda_batch(all_packets, n_frames_per)
+        torch.cuda.synchronize()
+        dec_cuda_ms = (time.perf_counter() - t0) * 1000
+        # Convert CUDA tensors to numpy for downstream reconstruction (one DtoH per
+        # tensor; not part of the timed decode region above)
+        all_decoded_via_cuda = [t.cpu().numpy() for t in decoded_cuda]
+
+        print(f"    decode (numpy/DtoH): {dec_ms:.1f} ms ({dec_ms/sum(n_frames_per):.3f} ms/f)")
+        print(f"    decode (torch/D2D):  {dec_cuda_ms:.1f} ms ({dec_cuda_ms/sum(n_frames_per):.3f} ms/f)")
+        return enc_ms, dec_cuda_ms, all_packets, all_decoded_via_cuda
     finally:
         multi.close()
 

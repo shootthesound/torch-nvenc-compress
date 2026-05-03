@@ -328,8 +328,31 @@ class DirectBackend:
     # ---- decode side ------------------------------------------------------
 
     def decode_frames(self, packets: list[bytes], n_frames: int) -> np.ndarray:
-        """Decode HEVC packets -> [N, 3, H, W] uint8 numpy array."""
-        out = np.empty((n_frames, 3, self.height, self.width), dtype=np.uint8)
+        """Decode HEVC packets -> [N, 3, H, W] uint8 numpy array.
+
+        For zero-copy decode that returns a torch CUDA tensor (no host
+        round-trip), use decode_frames_cuda() instead — it's substantially
+        faster on the decode path."""
+        out_t = self.decode_frames_cuda(packets, n_frames)
+        return out_t.cpu().numpy()
+
+    def decode_frames_cuda(self, packets: list[bytes], n_frames: int) -> torch.Tensor:
+        """Decode HEVC packets directly into a torch CUDA tensor [N, 3, H, W] uint8.
+
+        Skips the host round-trip entirely: each decoded frame is copied via
+        cuMemcpy2DAsync from the NVDEC-mapped pitched surface to the
+        appropriate slice of a pre-allocated torch CUDA tensor. The output
+        tensor stays on the GPU; caller can keep working with it there or
+        pull to CPU explicitly with .cpu().
+        """
+        # Pre-allocate the destination on GPU
+        out = torch.empty((n_frames, 3, self.height, self.width),
+                           device="cuda", dtype=torch.uint8)
+        out_base = int(out.data_ptr())
+        # Strides: row stride within a plane = width (uint8), plane stride = H*W,
+        # frame stride = 3*H*W. All in bytes since dtype=uint8.
+        plane_bytes = self.height * self.width
+        frame_bytes = 3 * plane_bytes
 
         # State shared between callbacks
         st = {
@@ -390,22 +413,40 @@ class DirectBackend:
                     return 1  # silently skip extras
                 proc = CUVIDPROCPARAMS()
                 proc.progressive_frame = 1
+                if self._user_stream is not None:
+                    proc.output_stream = self._user_stream
                 dptr, pitch = map_video_frame64(st["decoder"], disp.picture_index, proc)
 
                 plane_h = st["coded_h"]
-                total = pitch * plane_h * 3
-                host_buf = (ctypes.c_uint8 * total)()
-                err = cuda.cuMemcpyDtoH(host_buf, dptr, total)
+                # NVDEC YUV444 surface: 3 planes stacked, each pitch * plane_h bytes.
+                # Issue 3 cuMemcpy2DAsync (one per plane), copying width bytes per
+                # row, self.height rows, srcPitch=pitch, dstPitch=self.width.
+                # Output destination is the appropriate slice in our torch tensor.
+                seen = st["seen"]
+                frame_off = out_base + seen * frame_bytes
+                for plane in range(3):
+                    src = dptr + plane * pitch * plane_h
+                    dst = frame_off + plane * plane_bytes
+                    m2d = cuda.CUDA_MEMCPY2D()
+                    m2d.srcMemoryType = cuda.CUmemorytype.CU_MEMORYTYPE_DEVICE
+                    m2d.srcDevice = src
+                    m2d.srcPitch = pitch
+                    m2d.dstMemoryType = cuda.CUmemorytype.CU_MEMORYTYPE_DEVICE
+                    m2d.dstDevice = dst
+                    m2d.dstPitch = self.width
+                    m2d.WidthInBytes = self.width
+                    m2d.Height = self.height
+                    if self._user_stream is not None:
+                        err = cuda.cuMemcpy2DAsync(m2d, self._user_stream)
+                    else:
+                        err = cuda.cuMemcpy2D(m2d)
+                    err_int = int(err[0]) if isinstance(err, tuple) else int(err)
+                    if err_int != 0:
+                        unmap_video_frame64(st["decoder"], dptr)
+                        st["error"] = f"cuMemcpy2D plane {plane} err={err_int}"
+                        return 0
                 unmap_video_frame64(st["decoder"], dptr)
-                err_int = int(err[0]) if isinstance(err, tuple) else int(err)
-                if err_int != 0:
-                    st["error"] = f"cuMemcpyDtoH err={err_int}"
-                    return 0
-
-                # Reshape into a numpy view of the pitched buffer, then crop W per row
-                pitched = np.frombuffer(host_buf, dtype=np.uint8).reshape(3, plane_h, pitch)
-                out[st["seen"]] = pitched[:, : self.height, : self.width]
-                st["seen"] += 1
+                st["seen"] = seen + 1
                 return 1
             except Exception as e:
                 st["error"] = f"display cb: {e!r}"
@@ -426,8 +467,6 @@ class DirectBackend:
             pp.pfnGetSEIMsg = ctypes.cast(None, PFNVIDSEIMSGCALLBACK)
             parser = create_parser(pp)
             try:
-                # Concatenate packets — NVENC produces self-delimited Annex-B NAL
-                # units, so the parser can split them itself.
                 blob = b"".join(packets)
                 buf = (ctypes.c_uint8 * len(blob)).from_buffer_copy(blob)
                 pkt = CUVIDSOURCEDATAPACKET()
@@ -436,7 +475,6 @@ class DirectBackend:
                 pkt.payload = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8))
                 parse_video_data(parser, pkt)
 
-                # Flush
                 eos = CUVIDSOURCEDATAPACKET()
                 eos.flags = CUVID_PKT_ENDOFSTREAM
                 parse_video_data(parser, eos)
@@ -447,6 +485,12 @@ class DirectBackend:
                     raise RuntimeError(
                         f"decoded {st['seen']} frames, expected {n_frames}"
                     )
+                # If async copies were issued on a stream, sync it here
+                if self._user_stream is not None:
+                    err = cuda.cuStreamSynchronize(self._user_stream)
+                    err_int = int(err[0]) if isinstance(err, tuple) else int(err)
+                    if err_int != 0:
+                        raise RuntimeError(f"cuStreamSynchronize err={err_int}")
                 return out
             finally:
                 destroy_parser(parser)

@@ -185,6 +185,47 @@ class MultiEngineDirectBackend:
                 raise e
         return [r for r in results if r is not None]
 
+    # ---- zero-copy decode batch (returns torch CUDA tensors) -------------
+
+    def decode_frames_cuda_batch(self, packets_list: list[list[bytes]],
+                                   n_frames_per: list[int]) -> list[torch.Tensor]:
+        """Decode N bitstreams in parallel across engines, returning each
+        as a torch CUDA tensor [Ni, 3, H, W] uint8 — no host round-trip."""
+        n = len(packets_list)
+        if n == 0:
+            return []
+        if n != len(n_frames_per):
+            raise ValueError("packets_list and n_frames_per must be same length")
+
+        results: list[Optional[torch.Tensor]] = [None] * n
+        errors: list[Optional[BaseException]] = [None] * self.n_engines
+        assignments: list[list[int]] = [[] for _ in range(self.n_engines)]
+        for i in range(n):
+            assignments[i % self.n_engines].append(i)
+
+        def worker(engine_idx: int, indices: list[int]):
+            try:
+                backend = self.backends[engine_idx]
+                _attach_cuda_ctx(backend._cuda_ctx)
+                for i in indices:
+                    results[i] = backend.decode_frames_cuda(packets_list[i],
+                                                              n_frames_per[i])
+            except BaseException as e:
+                errors[engine_idx] = e
+
+        threads = [
+            threading.Thread(target=worker, args=(eid, idx_list))
+            for eid, idx_list in enumerate(assignments) if idx_list
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for e in errors:
+            if e is not None:
+                raise e
+        return [r for r in results if r is not None]
+
     # ---- lifecycle --------------------------------------------------------
 
     def close(self) -> None:
