@@ -185,11 +185,37 @@ The compression primitive + parallel-path reframe + the `DirectBackend` codec al
 
 NVENC has two compression modes: intra (each frame independent) and inter (each frame as a delta from the previous via motion vectors + residuals). The ML applications above use the intra side because PCA-rotated channels are orthogonal by construction (channel-reordering as a temporal stand-in is a [documented null finding](poc/null_findings/n3_channel_reorder.py)). But any GPU workload that produces *genuinely temporally-coherent* state can use the inter (P-frame) side as a free delta-codec — and most of video's compression magic actually lives there.
 
-- **Iterative numerical solvers (CFD, FEM, MD, weather)** — every timestep is a small perturbation of the previous, exactly the pattern P-frames were designed for. ✅ measured on a 2D heat-equation simulator in [`poc/20`](poc/20_heat_equation_pframe.py): a 1000-step trajectory compresses to ~1 MB as I-frames-only vs **41 KB as I + P-frame chain — a 24× P-frame win on top of the codec's intra compression**, at PSNR 52 dB. The same primitive should apply to multi-GPU domain decomposition (boundary-condition exchange between GPUs each timestep), HPC checkpointing (write deltas to disk instead of full state), and live remote simulation visualization.
-- **Progressive rendering / offline VFX render farms** — a path-traced frame accumulates over hundreds of sample passes, each a small noise-reduction delta on the previous accumulated result. P-frame compression of the sample-to-sample delta is a natural fit; a render farm shipping progressive samples between machines stops being network-bound. ⏳ codec primitive validated by `poc/20`; render-farm integration unwritten.
-- **Real-time scientific instruments** — microscopy, telescopes, particle accelerators producing time-series of large frames where consecutive frames are nearly identical. The P-frame chain compresses the GPU-to-storage path natively. ⏳ same primitive, different integration target.
+Two PoCs ship to validate this on real numerical workloads — one easy, one hard:
 
-The intellectual angle: this is the half of NVENC the project hasn't been advertising — the inter-frame mode is a separate completely-unused capability for non-video GPU workloads. The ML half ships today; the HPC/sci-viz/render-farm half is a small extension of the same library.
+**Easy test — diffusion (heat equation, [`poc/20`](poc/20_heat_equation_pframe.py))**
+
+A 2D heat equation simulator over 1000 timesteps. Smooth monotonic diffusion, no actual motion. Trajectory compresses to ~1 MB as I-frames-only vs **41 KB as I + P-frame chain — a 24× P-frame win on top of the codec's intra compression**, at PSNR 52 dB. This is the easy-mode result: the codec's residual coder wins big when consecutive frames look nearly identical.
+
+**Hard test — Von Kármán vortex street (incompressible Navier-Stokes, [`poc/21`](poc/21_vortex_street_pframe.py))**
+
+A 2D incompressible Navier-Stokes solver (Stam stable fluids) at Re=200 produces a textbook vortex street behind a cylinder — vortices that translate downstream AND get created/destroyed nonlinearly at the cylinder. The codec's motion estimation has actual work to do.
+
+![Von Kármán vortex street simulation](docs/figures/vortex_street_strip.png)
+
+Encoding the 1500-step vorticity trajectory: **2.6 MB as I-frames-only → 274 KB as I + P-frame chain. P-frame win 9.6× over I-only**, with the wake structure visually preserved end-to-end (mean abs error 0.001 across the field; outlier clipping at the cylinder surface limits the global PSNR number).
+
+Reconstruction quality is visually intact — the diff is concentrated entirely at the cylinder boundary, not in the wake we care about:
+
+![Vortex street reconstruction comparison](docs/figures/vortex_street_recon_vs_original.png)
+
+The per-frame bitstream profile shows what the codec is actually doing — flat ~2 KB/frame for I-only, vs steady-state ~50–300 bytes/frame for the P-frame chain (with periodic IDR-refresh spikes at every gopLength=250):
+
+![Per-frame bytes — I-only vs P-frame chain](docs/figures/vortex_pframe_bytes_per_step.png)
+
+**The takeaway**: P-frame compression delivers a strong win even on advection-dominated, nonlinear CFD — not as much as on pure diffusion (24× → 9.6×, the reduction is the cost of motion estimation having to handle real dynamics), but easily enough to be the right primitive for:
+
+- **Multi-GPU iterative solvers** (boundary-condition exchange between GPUs each timestep)
+- **HPC checkpointing** (write deltas to disk instead of full state at each save)
+- **Live remote simulation visualization** (stream a running CFD/weather sim to a remote viewer over a slow wire)
+- **Progressive rendering / offline VFX** (each sample-pass accumulation is a delta from the previous; ⏳ codec primitive validated, render-farm integration unwritten)
+- **Real-time scientific instruments** (microscopy, telescopes, accelerators producing time-series of similar frames; ⏳ same primitive, different integration)
+
+The intellectual angle: this is the half of NVENC the project's other PoCs haven't been advertising — the inter-frame mode is a separate completely-unused capability for non-video GPU workloads. The ML half ships in `DirectBackend`; the HPC/sci-viz/render-farm half is the same library, just fed time-series data instead of channel-stacked activations.
 
 ---
 
