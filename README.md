@@ -181,6 +181,16 @@ The compression primitive + parallel-path reframe + the `DirectBackend` codec al
 
 - **Concurrent ML and texture streaming** — A modern game (or DCC tool) running an ML model alongside a heavy 3D pipeline competes for PCIe bandwidth. Routing the ML activation traffic through NVENC silicon — which doesn't touch the SM cluster *or* the PCIe data path — leaves the main lanes free for textures. ✅ measured **~2× aggregate throughput** for heterogeneous traffic in [`poc/09`](poc/09_dual_lane.py). The dual-lane argument holds even when compression is poor or absent: the second lane is a *new* hardware data path, not just a smaller payload.
 
+### 6. Beyond ML — temporally-coherent GPU state (HPC, render farms, sci-viz)
+
+NVENC has two compression modes: intra (each frame independent) and inter (each frame as a delta from the previous via motion vectors + residuals). The ML applications above use the intra side because PCA-rotated channels are orthogonal by construction (channel-reordering as a temporal stand-in is a [documented null finding](poc/null_findings/n3_channel_reorder.py)). But any GPU workload that produces *genuinely temporally-coherent* state can use the inter (P-frame) side as a free delta-codec — and most of video's compression magic actually lives there.
+
+- **Iterative numerical solvers (CFD, FEM, MD, weather)** — every timestep is a small perturbation of the previous, exactly the pattern P-frames were designed for. ✅ measured on a 2D heat-equation simulator in [`poc/20`](poc/20_heat_equation_pframe.py): a 1000-step trajectory compresses to ~1 MB as I-frames-only vs **41 KB as I + P-frame chain — a 24× P-frame win on top of the codec's intra compression**, at PSNR 52 dB. The same primitive should apply to multi-GPU domain decomposition (boundary-condition exchange between GPUs each timestep), HPC checkpointing (write deltas to disk instead of full state), and live remote simulation visualization.
+- **Progressive rendering / offline VFX render farms** — a path-traced frame accumulates over hundreds of sample passes, each a small noise-reduction delta on the previous accumulated result. P-frame compression of the sample-to-sample delta is a natural fit; a render farm shipping progressive samples between machines stops being network-bound. ⏳ codec primitive validated by `poc/20`; render-farm integration unwritten.
+- **Real-time scientific instruments** — microscopy, telescopes, particle accelerators producing time-series of large frames where consecutive frames are nearly identical. The P-frame chain compresses the GPU-to-storage path natively. ⏳ same primitive, different integration target.
+
+The intellectual angle: this is the half of NVENC the project hasn't been advertising — the inter-frame mode is a separate completely-unused capability for non-video GPU workloads. The ML half ships today; the HPC/sci-viz/render-farm half is a small extension of the same library.
+
 ---
 
 ## What we actually measured (the compression Pareto)
