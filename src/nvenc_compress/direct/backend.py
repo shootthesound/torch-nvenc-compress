@@ -1,24 +1,38 @@
 """DirectBackend — drop-in replacement for CodecSession using direct ctypes.
 
-Same encode_frames / decode_frames interface as CodecSession, but the codec
-path is pure ctypes against the driver-shipped NVENC + NVDEC DLLs:
+The codec path is pure ctypes against the driver-shipped NVENC + NVDEC DLLs:
   - no PyAV subprocess
   - no PyNvVideoCodec dependency
   - no FFmpeg subprocess
 
 The encode side keeps one persistent NVENC session open across calls
-(matching CodecSession's amortised init behaviour). The decode side
-re-creates the parser per `decode_frames` call because cuvidParser doesn't
-cleanly reset between independent IDR-led streams (same constraint as
-CodecSession's PyAV path).
+(matching CodecSession's amortised init behaviour). The batch decode path
+re-creates the cuvidParser per `decode_frames` call because the parser
+doesn't cleanly reset between independent IDR-led streams; the streaming
+decode path keeps the parser alive across `decode_streaming` calls so a
+P-frame chain can be decoded one frame at a time.
 
-Limitations relative to CodecSession:
-- Currently uses NVENC's system-memory input buffer (write_input_buffer
-  copies frame bytes through host RAM). The CUDA-pointer zero-copy path
-  via nvEncRegisterResource is session-6 work; until then the host->device
-  copy is a real cost on the encode hot path.
-- The decode path also goes through host memory (cuMemcpyDtoH after
-  cuvidMapVideoFrame64). Zero-copy would map the device ptr to torch.
+Three encode entry points (pick one per call site):
+
+  - encode_frames(np.ndarray [N, 3, H, W] uint8) -> list[bytes]
+        Host-memory path; copies frames through write_input_buffer.
+        Backwards-compat for non-CUDA callers.
+
+  - encode_tensor_frames(torch.Tensor [N, 3, H, W] uint8 CUDA) -> list[bytes]
+        Zero-copy GPU path via nvEncRegisterResource. No CUDA<->host
+        round-trip on the hot path. Recommended for in-loop use.
+
+  - submit_streaming(yuv: torch.Tensor [3, H, W] uint8 CUDA) -> bytes
+        One-frame-at-a-time encode; GOP state persists across calls.
+        Pair with start_streaming() at session boundaries and
+        decode_streaming(packet) on the receiver. This is the API for
+        codec-in-loop scenarios (activation-checkpointing replacement,
+        per-step gradient compression, etc.).
+
+Lossless mode: pass `lossless=True` to the constructor to swap in
+NV_ENC_TUNING_INFO_LOSSLESS. The codec then round-trips bit-exactly at
+the YUV layer (file size ~3-5x larger than QP=18 lossy). QP is ignored
+in lossless mode.
 """
 
 from __future__ import annotations
@@ -93,7 +107,8 @@ class DirectBackend:
 
     def __init__(self, height: int, width: int, qp: int = 18,
                   cuda_stream: Optional[int] = None,
-                  output_pool_size: int = 8):
+                  output_pool_size: int = 8,
+                  lossless: bool = False):
         """If `cuda_stream` is given (an integer CUstream handle), encoder
         input fetch and bitstream copy are bound to it via
         nvEncSetIOCudaStreams, and per-frame cuMemcpyDtoDAsync uses the
@@ -104,10 +119,17 @@ class DirectBackend:
         allocate as a ring. Up to that many frames can be in flight on
         NVENC concurrently — the rest of the encode pipeline blocks on
         lock_bitstream. Default 8 is a reasonable trade between memory
-        and pipelining depth (each buffer is small, ~few KB)."""
+        and pipelining depth (each buffer is small, ~few KB).
+
+        `lossless` enables NVENC's HEVC lossless mode (NV_ENC_TUNING_INFO_LOSSLESS).
+        QP is ignored in this mode — output is bit-exact reconstruction of
+        the input. File size is typically 3-5x larger than QP=18 lossy.
+        """
+        from .api import NV_ENC_TUNING_INFO_LOSSLESS
         self.height = height
         self.width = width
         self.qp = qp
+        self.lossless = lossless
         self._user_stream = cuda_stream
         self._stream_handle_storage = None  # ctypes c_void_p kept alive for the encoder
         self._output_pool_size = max(1, int(output_pool_size))
@@ -118,10 +140,11 @@ class DirectBackend:
         self._table = create_instance()
         self._encoder = open_encode_session_cuda(self._table, self._cuda_ctx)
         try:
+            tuning_info = NV_ENC_TUNING_INFO_LOSSLESS if lossless else NV_ENC_TUNING_INFO_HIGH_QUALITY
             initialize_encoder_hevc_yuv444(
                 self._table, self._encoder,
                 NV_ENC_CODEC_HEVC_GUID, NV_ENC_PRESET_P4_GUID,
-                width, height, qp, tuning=NV_ENC_TUNING_INFO_HIGH_QUALITY,
+                width, height, qp, tuning=tuning_info,
             )
             self._in_buf = create_input_buffer(
                 self._table, self._encoder, width, height, NV_ENC_BUFFER_FORMAT_YUV444
@@ -196,6 +219,12 @@ class DirectBackend:
         self._lock.version = NV_ENC_LOCK_BITSTREAM_VER
         # Per-slot map-input-resource structs (filled lazily after registration).
         self._map_structs: list[NV_ENC_MAP_INPUT_RESOURCE] = []
+
+        # Streaming-mode state (used by start_streaming / submit_streaming /
+        # decode_streaming — one frame per call, GOP state persists). Idle
+        # until start_streaming() is called.
+        self._stream_idr_pending: bool = False
+        self._stream_decoder: Optional["_StreamingDecoder"] = None
 
         # Optional native (C) hot-loop helper. OPT-IN via env var
         # NVENC_DIRECT_NATIVE=1 — the C path is correct but doesn't beat
@@ -734,9 +763,126 @@ class DirectBackend:
         finally:
             ctx_lock_destroy(lock)
 
+    # ---- streaming API (one frame per call, GOP state persists) -----------
+    #
+    # The batch APIs (encode_tensor_frames + decode_frames_cuda) submit a
+    # whole trajectory at once. For dual-path simulation — running a
+    # baseline solver alongside a "codec-in-the-loop" copy where each
+    # timestep's state is round-tripped through the codec before feeding
+    # into the next solver step — we need a streaming variant that:
+    #
+    #   - Submits ONE frame per call, returns the packet immediately.
+    #   - Keeps the encoder's GOP state alive: only the first submit forces
+    #     IDR; subsequent submits get encoder-default frame types (P-frames
+    #     with periodic IDR refresh per the encoder's gopLength).
+    #   - Mirror on the decoder: keep the cuvid parser + decoder open
+    #     across calls; feed one packet, get one decoded frame back.
+
+    def start_streaming(self) -> None:
+        """Reset GOP state. The next submit_streaming() call forces IDR.
+        Also opens (or re-opens) the streaming decoder."""
+        self._stream_idr_pending = True
+        if self._stream_decoder is not None:
+            self._stream_decoder.close()
+        self._stream_decoder = _StreamingDecoder(
+            self.height, self.width, self._cuda_ctx,
+            user_stream=self._user_stream,
+        )
+
+    def submit_streaming(self, frame_yuv: torch.Tensor) -> bytes:
+        """Submit one [3, H, W] uint8 CUDA YUV444 frame, return its packet.
+
+        Encoder GOP state persists across calls — only the first submit
+        after start_streaming() forces IDR. Auto-IDR refresh per the
+        encoder's gopLength (default 250) still applies in between.
+        """
+        if not frame_yuv.is_cuda:
+            raise ValueError("frame must be on CUDA")
+        if frame_yuv.dtype != torch.uint8:
+            raise ValueError(f"frame must be uint8, got {frame_yuv.dtype}")
+        if frame_yuv.shape != (3, self.height, self.width):
+            raise ValueError(
+                f"frame shape {tuple(frame_yuv.shape)} doesn't match "
+                f"[3, {self.height}, {self.width}]"
+            )
+        if not frame_yuv.is_contiguous():
+            frame_yuv = frame_yuv.contiguous()
+
+        self._ensure_cuda_buf()  # idempotent
+
+        from ctypes import byref, string_at
+        per_frame_bytes = self._cuda_buf_size
+
+        # Use slot 0 as the streaming staging buffer.
+        slot_dst = self._cuda_bufs[0]
+        src_ptr = int(frame_yuv.data_ptr())
+        if self._user_stream is not None:
+            err = cuda.cuMemcpyDtoDAsync(slot_dst, src_ptr,
+                                          per_frame_bytes, self._user_stream)
+        else:
+            err = cuda.cuMemcpyDtoD(slot_dst, src_ptr, per_frame_bytes)
+        err_int = int(err[0]) if isinstance(err, tuple) else int(err)
+        if err_int != 0:
+            raise RuntimeError(f"cuMemcpy(D2D) failed: {err_int}")
+
+        mp = self._map_structs[0]
+        s = self._fn_map(self._encoder, byref(mp))
+        if s != 0:
+            raise RuntimeError(f"nvEncMapInputResource failed: status={s}")
+
+        flags_idr = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS
+        self._pic.inputBuffer = mp.mappedResource
+        self._pic.outputBitstream = self._out_pool[0]
+        self._pic.encodePicFlags = flags_idr if self._stream_idr_pending else 0
+        if self._stream_idr_pending:
+            self._stream_idr_pending = False
+
+        s = self._fn_encode(self._encoder, byref(self._pic))
+        if s != 0 and s != 14:
+            self._fn_unmap(self._encoder, mp.mappedResource)
+            mp.mappedResource = None
+            raise RuntimeError(f"nvEncEncodePicture failed: status={s}")
+        if s == 14:
+            # NEED_MORE_INPUT — encoder is buffering. Shouldn't happen with
+            # frameIntervalP=1 but guard anyway.
+            self._fn_unmap(self._encoder, mp.mappedResource)
+            mp.mappedResource = None
+            return b""
+
+        # Lock + read + unlock + unmap immediately.
+        self._lock.outputBitstream = self._out_pool[0]
+        s = self._fn_lock(self._encoder, byref(self._lock))
+        if s != 0:
+            raise RuntimeError(f"nvEncLockBitstream failed: status={s}")
+        pkt = string_at(self._lock.bitstreamBufferPtr,
+                          self._lock.bitstreamSizeInBytes)
+        s = self._fn_unlock(self._encoder, self._out_pool[0])
+        if s != 0:
+            raise RuntimeError(f"nvEncUnlockBitstream failed: status={s}")
+        s = self._fn_unmap(self._encoder, mp.mappedResource)
+        if s != 0:
+            raise RuntimeError(f"nvEncUnmapInputResource failed: status={s}")
+        mp.mappedResource = None
+        return pkt
+
+    def decode_streaming(self, packet: bytes) -> Optional[torch.Tensor]:
+        """Feed one packet to the streaming decoder, return the resulting
+        decoded [3, H, W] uint8 CUDA tensor (cloned, safe to retain across
+        subsequent calls), or None if the parser is buffering and no frame
+        is ready yet."""
+        if self._stream_decoder is None:
+            raise RuntimeError("call start_streaming() first")
+        return self._stream_decoder.feed(packet)
+
     # ---- lifecycle --------------------------------------------------------
 
     def close(self) -> None:
+        if self._stream_decoder is not None:
+            try:
+                self._stream_decoder.close()
+            except Exception:
+                pass
+            self._stream_decoder = None
         if self._encoder is not None:
             for rr in self._registered_res_pool:
                 try:
@@ -772,3 +918,225 @@ class DirectBackend:
 
     def __exit__(self, *_):
         self.close()
+
+
+class _StreamingDecoder:
+    """Persistent cuvid parser + decoder for one-packet-at-a-time decode.
+
+    Constructed by `DirectBackend.start_streaming()`. The parser + decoder
+    + ctx-lock stay open across calls to feed(); the only per-call work is
+    parse_video_data + (in the display callback) the cuMemcpy2DAsync into
+    the destination tensor.
+
+    Usage pattern:
+        sd = _StreamingDecoder(H, W, cuda_ctx)
+        for pkt in packet_stream:
+            frame = sd.feed(pkt)        # [3, H, W] uint8 CUDA, or None
+            if frame is not None: ...
+        sd.close()
+
+    Returned tensors are clones of an internal destination buffer — safe
+    to retain across subsequent feed() calls.
+    """
+
+    def __init__(self, height: int, width: int, cuda_ctx: int,
+                  user_stream: Optional[int] = None):
+        self.height = height
+        self.width = width
+        self._cuda_ctx = cuda_ctx
+        self._user_stream = user_stream
+
+        # Destination tensor — display callback writes here, feed() clones it
+        self._dest = torch.empty((3, height, width), device="cuda", dtype=torch.uint8)
+        self._dest_base = int(self._dest.data_ptr())
+        self._plane_bytes = height * width
+
+        # State that the callbacks need
+        self._st = {
+            "decoder": None,
+            "coded_w": 0,
+            "coded_h": 0,
+            "got_frame": False,
+            "error": None,
+        }
+
+        # ctx_lock — needed by the cuvid decoder
+        self._lock = ctx_lock_create(cuda_ctx)
+
+        # Build callbacks. They MUST be retained as instance attributes so
+        # ctypes doesn't garbage-collect them while cuvid still holds the
+        # function pointers.
+        self._cb_seq = self._make_sequence_cb()
+        self._cb_dec = self._make_decode_cb()
+        self._cb_disp = self._make_display_cb()
+        self._cb_oop = ctypes.cast(None, PFNVIDOPPOINTCALLBACK)
+        self._cb_sei = ctypes.cast(None, PFNVIDSEIMSGCALLBACK)
+
+        pp = CUVIDPARSERPARAMS()
+        pp.CodecType = cudaVideoCodec_HEVC
+        pp.ulMaxNumDecodeSurfaces = 4
+        pp.ulMaxDisplayDelay = 0
+        pp.ulErrorThreshold = 100
+        pp.pfnSequenceCallback = self._cb_seq
+        pp.pfnDecodePicture = self._cb_dec
+        pp.pfnDisplayPicture = self._cb_disp
+        pp.pfnGetOperatingPoint = self._cb_oop
+        pp.pfnGetSEIMsg = self._cb_sei
+        self._parser = create_parser(pp)
+
+    def _make_sequence_cb(self):
+        st = self._st
+        lock = self._lock
+        @PFNVIDSEQUENCECALLBACK
+        def cb(_user, fmt_ptr):
+            try:
+                fmt = fmt_ptr.contents
+                st["coded_w"] = fmt.coded_width
+                st["coded_h"] = fmt.coded_height
+                ci = CUVIDDECODECREATEINFO()
+                ci.ulWidth = fmt.coded_width
+                ci.ulHeight = fmt.coded_height
+                ci.ulNumDecodeSurfaces = max(4, fmt.min_num_decode_surfaces)
+                ci.CodecType = cudaVideoCodec_HEVC
+                ci.ChromaFormat = cudaVideoChromaFormat_444
+                ci.bitDepthMinus8 = fmt.bit_depth_luma_minus8
+                ci.ulCreationFlags = cudaVideoCreate_PreferCUVID
+                ci.ulMaxWidth = fmt.coded_width
+                ci.ulMaxHeight = fmt.coded_height
+                ci.display_area.left = 0
+                ci.display_area.top = 0
+                ci.display_area.right = fmt.coded_width
+                ci.display_area.bottom = fmt.coded_height
+                ci.OutputFormat = cudaVideoSurfaceFormat_YUV444
+                ci.DeinterlaceMode = cudaVideoDeinterlaceMode_Weave
+                ci.ulTargetWidth = fmt.coded_width
+                ci.ulTargetHeight = fmt.coded_height
+                ci.ulNumOutputSurfaces = 4
+                ci.vidLock = lock.value
+                st["decoder"] = create_decoder(ci)
+                return ci.ulNumDecodeSurfaces
+            except Exception as e:
+                st["error"] = f"sequence cb: {e!r}"
+                return 0
+        return cb
+
+    def _make_decode_cb(self):
+        st = self._st
+        @PFNVIDDECODECALLBACK
+        def cb(_user, pic_ptr):
+            try:
+                pp = pic_ptr.contents
+                decode_picture(st["decoder"], ctypes.addressof(pp))
+                return 1
+            except Exception as e:
+                st["error"] = f"decode cb: {e!r}"
+                return 0
+        return cb
+
+    def _make_display_cb(self):
+        st = self._st
+        H, W = self.height, self.width
+        dest_base = self._dest_base
+        plane_bytes = self._plane_bytes
+        user_stream = self._user_stream
+        @PFNVIDDISPLAYCALLBACK
+        def cb(_user, disp_ptr):
+            try:
+                disp = disp_ptr.contents
+                proc = CUVIDPROCPARAMS()
+                proc.progressive_frame = 1
+                if user_stream is not None:
+                    proc.output_stream = user_stream
+                dptr, pitch = map_video_frame64(st["decoder"], disp.picture_index, proc)
+                plane_h = st["coded_h"]
+                for plane in range(3):
+                    src = dptr + plane * pitch * plane_h
+                    dst = dest_base + plane * plane_bytes
+                    m2d = cuda.CUDA_MEMCPY2D()
+                    m2d.srcMemoryType = cuda.CUmemorytype.CU_MEMORYTYPE_DEVICE
+                    m2d.srcDevice = src
+                    m2d.srcPitch = pitch
+                    m2d.dstMemoryType = cuda.CUmemorytype.CU_MEMORYTYPE_DEVICE
+                    m2d.dstDevice = dst
+                    m2d.dstPitch = W
+                    m2d.WidthInBytes = W
+                    m2d.Height = H
+                    if user_stream is not None:
+                        err = cuda.cuMemcpy2DAsync(m2d, user_stream)
+                    else:
+                        err = cuda.cuMemcpy2D(m2d)
+                    err_int = int(err[0]) if isinstance(err, tuple) else int(err)
+                    if err_int != 0:
+                        unmap_video_frame64(st["decoder"], dptr)
+                        st["error"] = f"cuMemcpy2D plane {plane} err={err_int}"
+                        return 0
+                unmap_video_frame64(st["decoder"], dptr)
+                st["got_frame"] = True
+                return 1
+            except Exception as e:
+                st["error"] = f"display cb: {e!r}"
+                return 0
+        return cb
+
+    def feed(self, packet_bytes: bytes) -> Optional[torch.Tensor]:
+        """Feed one packet to the parser. Returns the decoded frame as a
+        cloned [3, H, W] uint8 CUDA tensor, or None if the parser is
+        buffering and no frame came out.
+
+        We set CUVID_PKT_ENDOFPICTURE on every packet so cuvid doesn't
+        wait for the next packet to confirm the current frame is complete
+        — without this, the parser typically holds back one frame and the
+        whole streaming pipeline runs one timestep behind."""
+        self._st["got_frame"] = False
+        if not packet_bytes:
+            return None
+        buf = (ctypes.c_uint8 * len(packet_bytes)).from_buffer_copy(packet_bytes)
+        pkt = CUVIDSOURCEDATAPACKET()
+        # 0x08 = CUVID_PKT_ENDOFPICTURE
+        pkt.flags = 0x08
+        pkt.payload_size = len(packet_bytes)
+        pkt.payload = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8))
+        parse_video_data(self._parser, pkt)
+
+        if self._st["error"]:
+            err = self._st["error"]
+            self._st["error"] = None
+            raise RuntimeError(err)
+
+        if not self._st["got_frame"]:
+            return None
+
+        # Sync the stream so the cuMemcpy2DAsync to dest is observable
+        if self._user_stream is not None:
+            err = cuda.cuStreamSynchronize(self._user_stream)
+            err_int = int(err[0]) if isinstance(err, tuple) else int(err)
+            if err_int != 0:
+                raise RuntimeError(f"cuStreamSynchronize err={err_int}")
+        return self._dest.clone()
+
+    def close(self) -> None:
+        try:
+            if self._parser is not None:
+                # Send EOS to flush before destroying parser.
+                eos = CUVIDSOURCEDATAPACKET()
+                eos.flags = CUVID_PKT_ENDOFSTREAM
+                try:
+                    parse_video_data(self._parser, eos)
+                except Exception:
+                    pass
+                destroy_parser(self._parser)
+                self._parser = None
+        except Exception:
+            pass
+        try:
+            if self._st.get("decoder") is not None:
+                destroy_decoder(self._st["decoder"])
+                self._st["decoder"] = None
+        except Exception:
+            pass
+        try:
+            if self._lock is not None:
+                ctx_lock_destroy(self._lock)
+                self._lock = None
+        except Exception:
+            pass

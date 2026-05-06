@@ -43,6 +43,37 @@ End-to-end speedup vs the original FFmpeg subprocess baseline:
 
 Plus a quality bonus (cos 0.9881 vs 0.9731) at slightly smaller bitstream — `DirectBackend` emits proper IDR keyframes where PyAV emits P-frames against a stale warmup reference (diagnosed in [`poc/19`](poc/19_direct_vs_pyav_diff.py)).
 
+### Per-frame latency — and where the codec is and isn't the right tool
+
+A fair question that comes up: *"how much latency does the codec add per frame? Doesn't that dominate any in-loop use case?"*
+
+The honest answer in two parts. Per-frame numbers from [`poc/20_streaming_path_bench.py`](poc/20_streaming_path_bench.py) on a Flux-block-sized 25 MB tensor (128 frames of [3, 256, 256] uint8), RTX 5090:
+
+| Path | Per-frame latency | Total round-trip | Encoded bytes |
+|---|---:|---:|---:|
+| `cuMemcpy` D→H→D (no codec) | 0.044 ms | 5.6 ms | 25 MB (raw) |
+| Codec lossless | 1.32 ms | 169 ms | 15 MB (1.7× compression) |
+| Codec QP=18 | 0.74 ms | 95 ms | 2.9 MB (8.7× compression) |
+| Codec QP=28 | 0.62 ms | 79 ms | 0.22 MB (113× compression) |
+
+**Same-device honest answer:** the codec is roughly 15–30× *slower* than a raw `cuMemcpy` round-trip on the same GPU. If your activation lives on one GPU and you're just swapping it in VRAM, **cuMemcpy is the right tool — the codec is the wrong one.**
+
+**Where the codec actually wins is when the wire matters.** The trade is `codec_latency + compressed_transit` vs `raw_transit`. Cross-wire crossover from PoC 20 at 25 MB / QP=18 / 8.7× compression:
+
+| Wire | Raw transit | Codec + transit | Speedup |
+|---|---:|---:|---|
+| PCIe Gen5 ×16 (~64 GB/s) | 0.39 ms | 94.79 ms | 0.00× — codec loses (too fast a wire) |
+| PCIe Gen4 ×16 (~32 GB/s) | 0.79 ms | 94.83 ms | 0.01× — loses |
+| NVMe Gen4 (~7 GB/s) | 3.6 ms | 95.16 ms | 0.04× — loses |
+| 10 Gbit ethernet | 20.13 ms | 97.06 ms | 0.21× — loses |
+| **1 Gbit ethernet** | **201 ms** | **118 ms** | **1.71× — codec wins** |
+
+QP=28 (113× compression) wins at 1 Gbit by 2.50× and breaks even higher up the stack but still loses on PCIe.
+
+**This means: the synchronous, sequential-codec usage pattern only beats raw transit on slow wires (1 Gbit ethernet, residential broadband, mobile).** The PCIe / NVLink-class wins quoted further down this README come from a *different* mechanism: **pipelining the codec on a separate CUDA stream so it runs concurrently with model compute, not in series with the transfer.** With proper streaming overlap (`nvEncSetIOCudaStreams`, `poc/17`), the codec time hides behind the next layer's matmul, and the user-visible cost reduces to PCIe transit of the *compressed* bytes — *that's* where the bandwidth-amplification table claims its 6×. Without overlap, the same numbers turn into 0.01× speedups (codec losing).
+
+So: **for in-VRAM same-device tensor swaps, use cuMemcpy. For cross-wire transfers with proper CUDA-stream overlap, the codec wins by the compression ratio. For sequential codec-in-loop with no overlap, the codec only beats raw transit on residential-broadband-class wires.**
+
 ### The parallel-path claim (NVENC silicon is independent of SM compute)
 
 ![Parallel-path overlap](docs/figures/parallel_path_overlap.png)
@@ -339,6 +370,7 @@ python poc/13_direct_nvenc_scaffold.py      # foundation: open/destroy lifecycle
 python poc/14_direct_nvenc_first_frame.py   # first end-to-end encode via direct path
 python poc/15_direct_nvdec_round_trip.py    # adds NVDEC decoder for full round-trip
 python poc/16_direct_backend_bench.py       # bench DirectBackend vs PyAV (2.0x encode, 3.4x decode)
+python poc/20_streaming_path_bench.py       # per-frame streaming + cross-wire latency, honest framing for "doesn't latency dominate?"
 python poc/17_parallel_path_demo.py         # NVENC encode runs concurrently with GEMM (validated)
 python poc/18_real_activation_bench.py      # real FLUX activations: 2.07x enc, 1.84x dec, 1.91x e2e
 python poc/19_direct_vs_pyav_diff.py        # bitstream/quality diff explained: PyAV emits P-frame, direct emits IDR
