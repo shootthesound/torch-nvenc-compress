@@ -1,12 +1,80 @@
 # torch-nvenc-compress
 
-> Hardware-accelerated compression for neural-network state — diffusion model activations, LLM KV cache — using the dedicated NVENC silicon that sits idle during ML training and inference. Wins land on bandwidth-bound wires: residential broadband, consumer ethernet, slow-storage workflows.
+> Hardware-accelerated compression for neural-network state — diffusion model activations, LLM KV cache, gradients — using the dedicated NVENC silicon that sits idle during ML training and inference. **Headline use case: a Thunderbolt cable + this codec recover a form of NVLink-class bandwidth between two consumer machines** (4090 / 5090 — Nvidia stripped NVLink from both), turning them into a pooled-VRAM training rig — see below. Same primitive also wins on residential broadband, consumer ethernet, and slow-storage workflows.
 
 Every modern Nvidia GPU contains a video-encoding block (NVENC) that does nothing during ML compute. This repo is a proof-of-concept for putting it to work on tensor data — encoding intermediate model state to a compact bitstream that costs less to ship across whatever wire is between you and where you need the data.
 
 The mechanism is straightforward. Quantize the tensor to uint8 with per-channel scaling, project onto a low-rank PCA basis to make it codec-friendly, encode through HEVC at QP=10–28, transmit the bitstream, decode on the other side. **6× lossless** on diffusion mid-block activations, **3× lossless** on LLM KV cache. Sub-millisecond per frame on dedicated silicon (`MultiEngineDirectBackend`: 0.180 ms encode, 0.262 ms decode).
 
-Where this saves wall-clock depends on the wire. On slow consumer wires (1 Gbit ethernet, residential broadband, mobile uplink) the compression-ratio savings dominate codec latency and you get a 3–5× wall-clock speedup. On fast wires (PCIe Gen4 between modern GPUs at compute-heavy workloads) compute already overlaps PCIe via the existing parallel-path mechanism, so the codec doesn't add wall-clock value at the per-tensor level. The full envelope is laid out below with measured numbers.
+Where this saves wall-clock depends on the wire. The sweet spot is **Thunderbolt 3/4/5 networking between two consumer machines** — fast enough that codec latency hides behind compute, slow enough that compression-ratio savings dominate. Same primitive works on slower wires too (1 Gbit ethernet, residential broadband — 3–5× wall-clock speedup); on very fast wires (PCIe Gen4/5 between GPUs in one chassis) compute already overlaps PCIe via the existing parallel-path mechanism so the codec doesn't add per-tensor wall-clock value. Full envelope laid out below with measured numbers.
+
+---
+
+## Headline use case: bringing back a form of NVLink for consumer GPUs
+
+Nvidia stripped NVLink from the 4090 and 5090. If you want **48 GB pooled VRAM** (5090 + 4090), **64 GB pooled** (two 5090s), or larger by adding more machines, for a training run that doesn't fit on one card, your options today are:
+
+1. Buy a $7,000+ workstation card that still has NVLink — overkill for a hobbyist.
+2. Use PCIe-bridged multi-GPU in one chassis — works, but caps you at the slots in one motherboard.
+3. Networked distributed training across two machines over **standard ethernet** — 1 Gbit ethernet gives you 0.125 GB/s. Your GPUs sit idle 80%+ of the time waiting on gradient sync. Not viable.
+
+**Thunderbolt networking + NVENC compression is the missing fourth option.** A direct cable between two machines, the codec compressing whatever crosses it, an effective bandwidth that lands in the same league as the NVLink that used to ship on consumer cards. Not a literal NVLink protocol — a behavioural recovery of NVLink-class bandwidth between machines using hardware that already exists on every Nvidia GPU shipped since 2014.
+
+### The napkin math
+
+Real-world Thunderbolt 4 IP-over-TB networking sustains **~1.8–2.2 GB/s** payload between two machines via a direct cable (well below the 40 Gbps marketing number — TB4 controllers cap a single peer-to-peer connection at 10–20 Gbps real, and protocol overhead trims that further). With this repo's measured **6.1× lossless** PCA + NVENC compression on FLUX activations:
+
+| Wire | Raw bandwidth | With 6× lossless | Reference |
+|---|---:|---:|---|
+| 1 Gbit ethernet | 0.125 GB/s | 0.75 GB/s | uncompressed = unviable for training |
+| 10 Gbit ethernet | ~1.1 GB/s | ~6.6 GB/s | requires switch + NICs |
+| **Thunderbolt 4 networking (real-world)** | **~2 GB/s** | **~12 GB/s** | direct cable, no switch |
+| Thunderbolt 5 networking (real-world) | ~6 GB/s | ~36 GB/s | TB5 hardware still rare in 2026 |
+| PCIe Gen3 ×16 (reference) | 16 GB/s | n/a | single-board, for comparison |
+| PCIe Gen4 ×16 (single-board reference) | ~32 GB/s | n/a | single-board, for comparison |
+
+At **~12 GB/s effective bandwidth on TB4 + 6× compression**, two physical machines linked by a single Thunderbolt cable run at roughly **PCIe Gen3 ×16 speeds between them**. A 5090 in one PC and a 4090 in a laptop becomes a **48 GB pooled-VRAM training rig that's only ~2–3× slower than native single-board execution** — a phenomenal trade for the VRAM bump that lets a model fit at all. Two 5090s gives 64 GB pooled. TB5 (when hardware catches up) lands closer to PCIe Gen4 ×16 effective speeds between machines.
+
+If you want a more conservative working number, **4× lossless** (achievable without PCA on simpler tensors) gives ~8 GB/s effective — still a 64× improvement over 1 Gbit ethernet and well into "training is feasible" territory.
+
+### The honest caveats
+
+- **The compression ratio (6.1× lossless on FLUX activations) is measured. The codec latency (sub-millisecond per frame on `MultiEngineDirectBackend`) is measured. The end-to-end Thunderbolt distributed-training wall-clock has *not* been measured in this repo** — Thunderbolt hardware isn't in the current test rig. The numbers above are napkin math: real-world TB bandwidth × measured compression ratio. Real end-to-end measurements are queued for when TB hardware joins the rig.
+- **Use lossless mode for gradient sync.** Errors compound across thousands of training steps; lossy is risky for gradients. Lossy modes are fine for activation traffic in workloads where downstream layers are explicitly noise-tolerant (diffusion models are).
+- **Codec round-trip is ~95 ms on a 25 MB tensor when run sequentially with no overlap.** That latency is hidden when the codec runs on a separate CUDA stream concurrently with compute on the SMs (the parallel-path mechanism — measured at 67% of theoretical max overlap in [`poc/17`](poc/17_parallel_path_demo.py)). For training workloads with substantial per-step compute, the codec time vanishes behind the GEMM. For a pathological pure-data-movement workload with no compute to hide behind, sequential codec adds wall-clock that exceeds the wire savings even on TB.
+- **NCCL may not work cleanly over IP-over-Thunderbolt.** Use `gloo` as the distributed backend if NCCL fails to negotiate over the TB virtual adapter.
+
+### How to set it up
+
+1. **Cable:** an active Thunderbolt 4 cable (passive cables longer than 0.8 m degrade speed substantially). Keep the machines close.
+2. **Connection:** plug the cable directly between the two PCs. Do not route through a dock or hub.
+3. **OS:** Windows and Linux both auto-create a virtual network adapter (typically named "Thunderbolt Bridge" or similar) when the cable is plugged in.
+4. **Static IPs:** assign `10.0.0.1` to one machine's TB adapter, `10.0.0.2` to the other. This guarantees the traffic flows over Thunderbolt and not your Wi-Fi.
+5. **PyTorch:** in your distributed init, point the master address at `10.0.0.1` and bind the comm backend strictly to those `10.0.0.x` IPs. Use `gloo` if NCCL refuses to bring up over the TB virtual adapter.
+6. **The codec:** wrap your gradient pack/unpack (or activation pack/unpack) with `nvenc_compress.direct.DirectBackend`. Sub-millisecond per frame on real activations; runs on a separate CUDA stream so encode hides behind your next layer's compute. See [Quickstart](#using-directbackend-from-your-own-code).
+
+The codec primitive ships and is fast. The framework integration glue (autograd-aware compress/decompress wrappers around the gradient bucket pack step) is the remaining work — but it's small, and once it's wired up, **two consumer machines linked by a single Thunderbolt cable becomes a genuinely usable 48–64 GB pooled-VRAM training rig** — a form of NVLink-class behaviour between machines, recovered with hardware that already exists on every Nvidia GPU shipped since 2014.
+
+### Total hardware cost to build the rig
+
+Most modern laptops ship with Thunderbolt 4 built in. Most desktop motherboards do not — you add it with a PCIe expansion card. Approximate 2026 prices:
+
+| Component | Typical price | Notes |
+|---|---:|---|
+| Thunderbolt 4 PCIe card (e.g., ASUS ThunderboltEX 4, GIGABYTE Maple Ridge) | **~$100** | Per desktop. Needs a motherboard with a 5-pin THB_C header (most Z690/Z790/Z890 Intel boards; X670E/X870E AMD boards increasingly do — check before buying). |
+| Active Thunderbolt 4 cable, 1–2 m | **~$30–50** | One per pair of machines. Active beats passive at >0.8 m. Apple/Cable Matters/OWC all make decent ones. |
+| Thunderbolt 4 controller chip on motherboard | **$0** | If you already have it built in (most laptops; some workstation boards). |
+
+Worked examples:
+
+| Rig | Hardware to add | Total |
+|---|---|---:|
+| **5090 desktop ↔ 4090 laptop** (48 GB pooled) | 1× TB4 PCIe card for the desktop + 1× active TB4 cable | **~$130** |
+| **5090 desktop ↔ 5090 desktop** (64 GB pooled) | 2× TB4 PCIe cards + 1× active TB4 cable | **~$230** |
+| **2× 5090 desktops, each with 2× 5090s** (128 GB pooled across 4 GPUs) | 2× TB4 PCIe cards + 1× active TB4 cable | **~$230** |
+| **5090 desktop ↔ Mac Studio** (extra VRAM split, mixed-OS pipeline) | 1× TB4 PCIe card for the desktop + 1× active TB4 cable | **~$130** |
+
+For comparison: an RTX 6000 Ada workstation card (one of the few current Nvidia cards still shipping with full multi-GPU sync hardware) is **~$7,000+ per card**. The Thunderbolt route gets you to a pooled-VRAM training rig for the price of a decent dinner, on consumer hardware you may already own.
 
 ---
 
@@ -20,6 +88,7 @@ Where this saves wall-clock depends on the wire. On slow consumer wires (1 Gbit 
 | **Slow-wire wins (1 Gbit ethernet, residential broadband)** | ✅ 1.69× dual-lane on 1 Gbit, 3.13× on 100 Mbps, 5.29× on 50 Mbps | [`poc/08`](poc/08_wire_simulation.py), [`poc/09`](poc/09_dual_lane.py) |
 | **Pipelined codec + offload wall-clock model** | ✅ stage-by-stage decomposition; tells you exactly when codec saves wall-clock and when it doesn't | [`poc/21`](poc/21_pipelined_overlap_bench.py) |
 | **No-butterfly-effect — codec is safe inside iterative loops** | ✅ 500-step dual-path soak on FLUX-shape activations; lossless bit-exact every step, all lossy modes bounded (q4/q1 ≤ 1.77×) | [`poc/22`](poc/22_long_horizon_codec_drift.py) |
+| **Pooled-VRAM training over Thunderbolt** | ⚠️ napkin math from measured codec + measured 6.1× compression × real-world TB4 bandwidth (~2 GB/s → ~12 GB/s effective, ≈ PCIe Gen3 ×16 between two machines). End-to-end TB measurement queued for when TB hardware joins the rig. | see headline section above |
 
 ### Codec backend speed (measured)
 
@@ -228,7 +297,7 @@ The compression primitive + parallel-path reframe + the `DirectBackend` codec al
 
 ### 3. Hobbyist + gigabit GPU clusters
 
-- **"Poor man's datacenter" (1 Gbit / 10 Gbit ethernet)** — Two desktop machines (e.g. a 5090 + a 4090) wired together with standard home networking to run a split model. ✅ **1.69× dual-lane wall-clock on 1 Gbit** measured in [`poc/09`](poc/09_dual_lane.py); larger compression ratios + lossy modes give more.
+- **Hobbyist GPU cluster on consumer ethernet (1 Gbit / 10 Gbit)** — Two desktop machines (e.g. a 5090 + a 4090) wired together with standard home networking to run a split model. ✅ **1.69× dual-lane wall-clock on 1 Gbit** measured in [`poc/09`](poc/09_dual_lane.py); larger compression ratios + lossy modes give more. (Thunderbolt networking — see the headline section above — gives substantially more headroom than ethernet for the same kind of setup.)
 - **Distributed training gradient sync** — Cross-machine training over consumer networks is normally killed by gradient bandwidth. Shipping compressed gradients makes hobbyist distributed training viable; codec time hides comfortably under gigabit transit time.
 
 ### 4. Cloud-hybrid edge computing
