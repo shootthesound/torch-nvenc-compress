@@ -19,6 +19,7 @@ Where this saves wall-clock depends on the wire. On slow consumer wires (1 Gbit 
 | **NVENC silicon runs concurrently with SM compute** | ✅ 67% of theoretical-max parallel-path overlap; 1.34× over serialised GEMM + encode | [`poc/17`](poc/17_parallel_path_demo.py) |
 | **Slow-wire wins (1 Gbit ethernet, residential broadband)** | ✅ 1.69× dual-lane on 1 Gbit, 3.13× on 100 Mbps, 5.29× on 50 Mbps | [`poc/08`](poc/08_wire_simulation.py), [`poc/09`](poc/09_dual_lane.py) |
 | **Pipelined codec + offload wall-clock model** | ✅ stage-by-stage decomposition; tells you exactly when codec saves wall-clock and when it doesn't | [`poc/21`](poc/21_pipelined_overlap_bench.py) |
+| **No-butterfly-effect — codec is safe inside iterative loops** | ✅ 500-step dual-path soak on FLUX-shape activations; lossless bit-exact every step, all lossy modes bounded (q4/q1 ≤ 1.77×) | [`poc/22`](poc/22_long_horizon_codec_drift.py) |
 
 ### Codec backend speed (measured)
 
@@ -68,6 +69,23 @@ QP=28 (113× compression) wins at 1 Gbit by 2.50× and breaks even higher up the
 **For in-VRAM same-device tensor swaps (compute on one GPU, activation moves around in its own VRAM), use cuMemcpy — it's an order of magnitude faster than the codec at this kind of work.** The codec lane's wins are about putting compressed bytes on a *different* wire (a slower one) where the compression-ratio savings dominate codec latency. Where a separate-stream `nvEncSetIOCudaStreams` overlap with compute helps is in dual-lane / sustained-streaming scenarios — the codec produces compressed bytes concurrently with the next layer's matmul, then the small bytes go on the wire. Without overlap, codec is just sequential latency.
 
 So: **for in-VRAM same-device tensor swaps, use cuMemcpy. For cross-wire transfers with proper CUDA-stream overlap, the codec wins by the compression ratio. For sequential codec-in-loop with no overlap, the codec only beats raw transit on residential-broadband-class wires.**
+
+### Long-horizon drift — codec stays bounded across many in-loop steps
+
+A second question that comes up after per-frame latency: *"if the codec sits inside a feedback loop where each step's output feeds the next step's input, does quantization noise compound across many steps?"* This is the load-bearing concern for any in-loop scenario — activation checkpointing during training, iterative inference, KV-cache compression across decode steps.
+
+[`poc/22_long_horizon_codec_drift.py`](poc/22_long_horizon_codec_drift.py) runs a 500-step dual-path soak on a FLUX-shape activation (heavy-tailed channel covariance, ~6 MB, packed as YUV444 frames). Both paths share the same initial state and receive identical Gaussian per-step perturbations; one path's state runs through the codec round-trip every step, the other doesn't. Per-step max-abs diff between the two paths is the drift signal:
+
+| Mode | q1 mean (steps 50–162) | q4 mean (last quarter) | q4/q1 | Verdict |
+|---|---:|---:|---:|---|
+| Lossless (bit-exact) | 0.000 | 0.000 | 0.00× | bit-exact every step |
+| QP=10 (near-lossless) | 93.4 | 130.0 | 1.39× | bounded |
+| QP=18 (standard) | 99.3 | 130.1 | 1.31× | bounded |
+| QP=28 (high compression) | 125.5 | 221.7 | 1.77× | bounded |
+
+![Long-horizon codec drift](docs/figures/long_horizon_codec_drift.png)
+
+All four modes saturate to a steady-state error floor rather than growing exponentially (q4/q1 ≪ 3×, the threshold beyond which drift would indicate compounding instability). Lossless is bit-exact across the whole soak — the dual-path harness records 0 every step. This is the same shape of test the sibling `vortex/` repo runs on Navier-Stokes solver state at 5000 steps; this repo's PoC 22 brings the same answer to ML-shape data. The codec is safe to sit inside a training loop or iterative-inference loop without destabilising the trajectory.
 
 ### The parallel-path claim (NVENC silicon is independent of SM compute)
 
@@ -384,6 +402,7 @@ python poc/20_streaming_path_bench.py       # per-frame streaming + cross-wire l
 python poc/17_parallel_path_demo.py         # NVENC encode runs concurrently with GEMM (validated)
 python poc/18_real_activation_bench.py      # real FLUX activations: 2.07x enc, 1.84x dec, 1.91x e2e
 python poc/19_direct_vs_pyav_diff.py        # bitstream/quality diff explained: PyAV emits P-frame, direct emits IDR
+python poc/22_long_horizon_codec_drift.py   # 500-step in-loop drift soak: lossless bit-exact, lossy bounded
 
 # Honest null findings — what we tried that didn't help
 python poc/null_findings/n1_sparse_residual.py
