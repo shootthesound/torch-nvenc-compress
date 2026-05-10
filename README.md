@@ -37,6 +37,24 @@ At **~12 GB/s effective bandwidth on TB4 + 6× compression**, two physical machi
 
 If you want a more conservative working number, **4× lossless** (achievable without PCA on simpler tensors) gives ~8 GB/s effective — still a 64× improvement over 1 Gbit ethernet and well into "training is feasible" territory.
 
+### Worked example: large LLMs across two consumer GPUs
+
+The most-asked-for use case in the LocalLLaMA / hobbyist crowd: *"How do I run Llama 3.1 70B (or Mistral Large 2, or Llama 3.1 405B) at a quant that doesn't degrade output quality, on consumer hardware, at home?"* The answer today is mostly "you can't, unless you buy a $5,000+ workstation card or accept aggressive Q3 quants." With Thunderbolt + this codec:
+
+| Rig | Pooled VRAM | What fits |
+|---|---:|---|
+| 5090 + 4090 laptop | 48 GB | **Llama 3.1 70B Q4_K_M** (~40 GB) with 8 GB headroom for context |
+| 2× 5090 desktops | 64 GB | **Llama 3.1 70B Q5_K_M** (~50 GB), or **Mistral Large 2 (123B) Q4** (~62 GB) |
+| 2 desktops × 2× 5090 (4 GPUs) | 128 GB | **Llama 3.1 405B IQ2_XS** (~110 GB) — frontier-class model, on consumer hardware, at home |
+
+**Where bandwidth matters for inference, and where it doesn't:**
+
+- **Decode** (the 99% of wall-clock during a chat session): pipeline-parallel splits layers across the two machines; each generated token streams a single hidden state across the wire — a few KB at typical hidden dimensions. Decode is *not* bandwidth-bound at Thunderbolt speeds even uncompressed; it runs at full local-card speed modulo a small per-token cross-machine round-trip.
+- **Prefill** (the wait between submitting a prompt and the first token streaming back): activation per cross-machine layer boundary = `seq_len × hidden_dim × dtype`. An 8K prompt at FP16 / hidden 8192 is ~64 MB per boundary. Raw TB4 (~2 GB/s) = ~32 ms per layer boundary; **with 6× lossless codec compression that drops to ~5 ms per boundary — roughly 6× faster prefill, the direct codec win on the inference side.**
+- **LoRA fine-tuning of a large model** (the use case that's usually completely off-limits on consumer hardware): gradient sync each step is the bandwidth burner. 6× compression on gradient traffic between machines is a large multi-step training-time win, on top of the pooled-VRAM-makes-it-fit-at-all win.
+
+For price comparison: a single RTX A6000 (48 GB workstation card) is ~$4,000+ alone. The 5090 + 4090 + Thunderbolt setup lands you at the same pooled VRAM for less than the A6000 by itself, on hardware you may already own — and the 4-GPU rig at 128 GB pooled gets you into territory where you can run models (405B, frontier-class Mistral / Qwen) that would otherwise need an enterprise H100 8-GPU node.
+
 ### The honest caveats
 
 - **The compression ratio (6.1× lossless on FLUX activations) is measured. The codec latency (sub-millisecond per frame on `MultiEngineDirectBackend`) is measured. The end-to-end Thunderbolt distributed-training wall-clock has *not* been measured in this repo** — Thunderbolt hardware isn't in the current test rig. The numbers above are napkin math: real-world TB bandwidth × measured compression ratio. Real end-to-end measurements are queued for when TB hardware joins the rig.
