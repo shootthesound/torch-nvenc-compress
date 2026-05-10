@@ -32,3 +32,6 @@ data/**/*.bin
 # OS
 .DS_Store
 Thumbs.db
+
+# Local LLM split-inference test rig (per-machine, not for distribution)
+llmtests/
