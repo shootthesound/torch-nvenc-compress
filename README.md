@@ -1,12 +1,26 @@
 # torch-nvenc-compress
 
-> Hardware-accelerated compression for neural-network state — diffusion model activations, LLM KV cache, gradients — using the dedicated NVENC silicon that sits idle during ML training and inference. **Headline use case: a Thunderbolt cable + this codec recover a form of NVLink-class bandwidth between two consumer machines** (4090 / 5090 — Nvidia stripped NVLink from both), turning them into a pooled-VRAM training rig — see below. Same primitive also wins on residential broadband, consumer ethernet, and slow-storage workflows.
+> A **reusable codec library** for neural-network state — diffusion model activations, LLM KV cache, gradients — using the dedicated NVENC silicon that sits idle during ML training and inference. The base primitive that downstream repos build on top of. **Public consumer:** [comfyui-mesh](https://github.com/shootthesound/comfyui-mesh) — splits a FLUX.2 diffusion model across two GPUs and uses this codec to compress activations on the wire. Use-case envelope (Thunderbolt-as-NVLink, residential broadband, consumer ethernet, slow-storage) and the original PoC measurements laid out further down.
 
-Every modern Nvidia GPU contains a video-encoding block (NVENC) that does nothing during ML compute. This repo is a proof-of-concept for putting it to work on tensor data — encoding intermediate model state to a compact bitstream that costs less to ship across whatever wire is between you and where you need the data.
+Every modern Nvidia GPU contains a video-encoding block (NVENC) that does nothing during ML compute. This repo's job is to make it usable on tensor data — encoding intermediate model state to a compact bitstream that costs less to ship across whatever wire is between you and where you need the data. The codec wrapper (`src/nvenc_compress/direct/`) is the load-bearing piece; the rest of the repo is measurement scaffolding + reference applications.
 
 The mechanism is straightforward. Quantize the tensor to uint8 with per-channel scaling, project onto a low-rank PCA basis to make it codec-friendly, encode through HEVC at QP=10–28, transmit the bitstream, decode on the other side. **6× lossless** on diffusion mid-block activations, **3× lossless** on LLM KV cache. Sub-millisecond per frame on dedicated silicon (`MultiEngineDirectBackend`: 0.180 ms encode, 0.262 ms decode).
 
 Where this saves wall-clock depends on the wire. The sweet spot is **Thunderbolt 3/4/5 networking between two consumer machines** — fast enough that codec latency hides behind compute, slow enough that compression-ratio savings dominate. Same primitive works on slower wires too (1 Gbit ethernet, residential broadband — 3–5× wall-clock speedup); on very fast wires (PCIe Gen4/5 between GPUs in one chassis) compute already overlaps PCIe via the existing parallel-path mechanism so the codec doesn't add per-tensor wall-clock value. Full envelope laid out below with measured numbers.
+
+<a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
+
+If this project saves you buying a new GPU, please consider donating — it helps me support more models beyond the FLUX.2 family and keep this thing maintained.
+
+---
+
+## Foundation for downstream tools
+
+This repo is the canonical home for the codec — application code lives in separate repos that build on it. Public implementations:
+
+- **[comfyui-mesh](https://github.com/shootthesound/comfyui-mesh)** — splits a FLUX.2 diffusion model across two GPUs (LAN or same-machine); this codec compresses activations live on the wire. Concrete demo: ~4.4 s/image for FLUX.2 Klein 9B at 1024² across an RTX 5090 + RTX 4090 over plain gigabit ethernet.
+
+If you build on this codec for LLM work, video models, scientific-compute state, or anything else, open an issue / PR to be listed here.
 
 ---
 
@@ -559,10 +573,8 @@ This repo's added contributions over those (PCA + rank-truncation as the load-be
 
 This project has been months of independent research and engineering — designing the PCA + codec pipeline, validating it across 1,735 FLUX captures, writing the direct Video Codec SDK bindings from scratch (~800 lines of ctypes structs verified field-by-field against `nvEncodeAPI.h`), tracking down every silent struct-layout bug to make the speedup numbers above real, and writing it all up so others can reproduce it.
 
-I'm a work-from-home dad, and the time for this happens around caring for two children with additional needs. If any of this work is useful to you and you'd like to help make more of it possible, a coffee genuinely helps — there's no expectation, just gratitude for whatever lands.
+<a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
 
-<p align="left">
-  <a href="https://buymeacoffee.com/lorasandlenses">
-    <img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy me a coffee" />
-  </a>
-</p>
+**Why it matters to me**
+
+I'm a parent working from home, supporting a long-term ill child alongside my wife. As much as this dev work is a passion, it's also a needed distraction — and donations genuinely help keep the lights on right now.
